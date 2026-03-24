@@ -1,0 +1,21 @@
+{
+  "name": "recce",
+  "version": "1.0.0",
+  "description": "Standalone E2E Sanity Suite for Valors",
+  "main": "index.js",
+  "scripts": {
+    "test": "playwright test",
+    "report": "playwright show-report"
+  },
+  "keywords": [
+    "playwright",
+    "e2e",
+    "testing",
+    "sanity"
+  ],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@playwright/test": "^1.58.2"
+  }
+}
