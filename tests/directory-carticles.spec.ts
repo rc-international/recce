@@ -5,10 +5,11 @@ import { test, expect } from '@playwright/test';
  */
 test.describe('Directory / Carticles E2E Suite', () => {
 
-  const targetUrl = 'http://localhost:3000/directory/en/Mexico/CDMX/Ciudad-de-Mexico/coffee_shop';
-  const merchantUrl = 'http://localhost:3000/sites/en/Mexico/CDMX/Ciudad-de-Mexico/coffee_shop/blend-station/88e4fc';
+  const directoryPath = '/directory/en/Mexico/CDMX/Ciudad-de-Mexico/coffee_shop';
+  const merchantPath = '/sites/en/Mexico/CDMX/Ciudad-de-Mexico/coffee_shop/blend-station/88e4fc';
 
-  test('Verify Merchant Page: Hero Image, Content, and Form', async ({ page }) => {
+  test('Verify Merchant Page: Hero Image, Content, and Form', async ({ page, baseURL }) => {
+    const merchantUrl = `${baseURL}${merchantPath}`;
     await page.goto(merchantUrl, { waitUntil: 'networkidle' });
 
     // 1. Verify Main Image
@@ -60,8 +61,9 @@ test.describe('Directory / Carticles E2E Suite', () => {
     await page.screenshot({ path: 'merchant-form-submitted.png' });
   });
 
-  test('Crawl and Verify Article Integrity', async ({ page }) => {
+  test('Crawl and Verify Article Integrity', async ({ page, baseURL }) => {
     // If directory is empty, we test the known merchant URL as a "sample"
+    const merchantUrl = `${baseURL}${merchantPath}`;
     const urlsToTest = [merchantUrl];
 
     for (const fullUrl of urlsToTest) {
@@ -90,7 +92,8 @@ test.describe('Directory / Carticles E2E Suite', () => {
     }
   });
 
-  test('Verify All Buttons on Homepage', async ({ page }) => {
+  test('Verify All Buttons on Homepage', async ({ page, baseURL }) => {
+    const targetUrl = `${baseURL}${directoryPath}`;
     await page.goto(targetUrl, { waitUntil: 'networkidle' });
 
     const buttons = await page.locator('button, a[role="button"], a.btn').all();
