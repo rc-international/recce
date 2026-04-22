@@ -1,0 +1,14 @@
+# Code Review CI — installed by org-wide rollout 2026-04-22
+# AI-powered code review on every PR via rc-international/ci
+# Required org secret: CEREBRAS_API_KEY
+
+name: Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  review:
+    uses: rc-international/ci/.github/workflows/code-review.yml@main
+    secrets: inherit
