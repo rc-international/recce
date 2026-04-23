@@ -8,6 +8,12 @@ import { defineConfig, devices } from "@playwright/test";
  */
 export default defineConfig({
 	testDir: "./tests",
+	// tests/unit/** is driven by `bun test`, not Playwright — those files import
+	// `bun:test`, which Playwright's transformer can't resolve. Keep them out of
+	// the Playwright test sweep so both runners can coexist.
+	testIgnore: ["**/unit/**"],
+	globalSetup: "./tests/global-setup.ts",
+	globalTeardown: "./tests/global-teardown.ts",
 	fullyParallel: true,
 	forbidOnly: !!process.env.CI,
 	retries: process.env.CI ? 2 : 0,
