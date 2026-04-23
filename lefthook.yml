@@ -1,0 +1,106 @@
+pre-commit:
+  parallel: true
+  commands:
+    worktree-branch-guard:
+      run: |
+        TOPLEVEL=$(git rev-parse --show-toplevel)
+        git worktree list --porcelain 2>/dev/null | awk '/^worktree/{wt=$2} /^branch/{print wt " " $2}' | \
+        while IFS=' ' read -r wt br; do
+          CURRENT=$(git branch --show-current)
+          if [ "refs/heads/$CURRENT" = "$br" ] && [ "$wt" != "$TOPLEVEL" ]; then
+            echo "ERROR: Branch '$CURRENT' belongs to worktree $wt, not $TOPLEVEL"
+            echo "Run your commit from: $wt"
+            exit 1
+          fi
+        done
+    biome-check:
+      glob: "*.{ts,tsx,js,jsx,json}"
+      run: npx @biomejs/biome check --write --no-errors-on-unmatched --files-ignore-unknown=true {staged_files}
+      stage_fixed: true
+    markdown-lint:
+      glob: "*.md"
+      exclude: "skills/**"
+      run: npx markdownlint-cli2 {staged_files}
+    shellcheck:
+      glob: "*.sh"
+      run: 'command -v shellcheck >/dev/null && shellcheck --severity=warning {staged_files} || echo "shellcheck not installed, skipping"'
+    typos:
+      glob: "*.{ts,tsx,js,jsx,json,md,sh,py,yml,yaml,toml}"
+      run: 'command -v typos >/dev/null && typos {staged_files} || echo "typos not installed, skipping"'
+    black:
+      glob: "*.py"
+      run: 'command -v black >/dev/null && black --quiet {staged_files} || echo "black not installed, skipping"'
+      stage_fixed: true
+    hook-tests:
+      glob: "*.{ts,tsx}"
+      # Excluded hook tests:
+      #   daemon-client        — requires running TLDR daemon (Unix socket)
+      #   session-start-recall — uses vitest, incompatible with bun test runner
+      #   skill-coactivation   — TDD stub, not yet implemented
+      #   skill-loading        — TDD stub, not yet implemented
+      #   skill-prerequisites  — TDD stub, not yet implemented
+      #   skill-router-integration — TDD stub, not yet implemented
+      #   skill-toposort       — TDD stub, not yet implemented
+      # | sort ensures deterministic ordering to prevent order-dependent flakes
+      # Skip cleanly in repos that have no hooks/ source tree (e.g. recce).
+      run: |
+        if [ ! -d hooks ]; then echo "no hooks/ dir — skipping hook-tests"; exit 0; fi
+        timeout 60 sh -c '
+          cd hooks && bun test --timeout 10000 \
+            $(find src/__tests__ -name "*.test.ts" \
+              ! -name "daemon-client*" \
+              ! -name "session-start-recall*" \
+              ! -name "skill-coactivation*" \
+              ! -name "skill-loading*" \
+              ! -name "skill-prerequisites*" \
+              ! -name "skill-router-integration*" \
+              ! -name "skill-toposort*" \
+              | sort) 2>&1'
+        rc=$?
+        if [ $rc -eq 124 ]; then echo "hook tests TIMED OUT"; exit 1
+        elif [ $rc -ne 0 ]; then echo "hook tests FAILED (exit $rc)"; exit 1; fi
+    typecheck:
+      glob: "*.{ts,tsx}"
+      exclude: "companion/**"
+      run: timeout 60 bun run typecheck
+    test-suite:
+      glob: "*.{ts,tsx}"
+      exclude: "companion/**"
+      # Excluded unit tests:
+      #   learning-extractor — requires integration setup (DB, side-effectful imports)
+      #   skill-activations  — stale exclusion, test file no longer exists
+      #   cli-update         — invokes Python subprocess, slow/integration-scoped
+      #   update-script      — runs shell script in tmp dirs, slow/flaky
+      # | sort ensures deterministic ordering to prevent order-dependent flakes
+      # Skip cleanly in repos that have no tests/unit/ tree. E2E-only repos
+      # (e.g. recce, which uses Playwright in tests/) run their suites in CI
+      # and a daily cron — they are too heavy for a pre-commit gate.
+      run: |
+        if [ ! -d tests/unit ]; then echo "no tests/unit/ dir — skipping test-suite"; exit 0; fi
+        timeout 60 bun test \
+          $(find tests/unit -name '*.test.ts' \
+            ! -name 'learning-extractor*' \
+            ! -name 'skill-activations*' \
+            ! -name 'cli-update*' \
+            ! -name 'update-script*' \
+            | sort)
+        rc=$?
+        if [ $rc -eq 124 ]; then echo "test-suite TIMED OUT"; exit 1
+        elif [ $rc -ne 0 ]; then echo "test-suite FAILED (exit $rc)"; exit 1; fi
+    # companion-tests run in pre-push (not pre-commit) due to ~2min runtime with isolation.
+    # See companion-checks in the pre-push section below.
+commit-msg:
+  commands:
+    commitlint:
+      run: npx commitlint --edit {1}
+
+pre-push:
+  parallel: true
+  commands:
+    semgrep:
+      run: 'command -v semgrep >/dev/null && semgrep --config auto --severity ERROR --quiet src/ wilco_cli/ scripts/ companion/web/src/ companion/web/server/ || echo "semgrep not installed, skipping"'
+    security-audit:
+      run: bun audit 2>/dev/null || true
+    companion-checks:
+      # --foreground propagates signals to xargs child processes; --kill-after ensures cleanup if SIGTERM is ignored
+      run: timeout --kill-after=10 60 bun run companion:typecheck && BUN_TEST_WORKERS=3 timeout --foreground --kill-after=30 120 bun run companion:test

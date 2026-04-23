@@ -1,21 +1,27 @@
 {
-  "name": "recce",
-  "version": "1.0.0",
-  "description": "Standalone E2E Sanity Suite for Valors",
-  "main": "index.js",
-  "scripts": {
-    "test": "playwright test",
-    "report": "playwright show-report"
-  },
-  "keywords": [
-    "playwright",
-    "e2e",
-    "testing",
-    "sanity"
-  ],
-  "author": "",
-  "license": "ISC",
-  "devDependencies": {
-    "@playwright/test": "^1.58.2"
-  }
+	"name": "recce",
+	"version": "1.0.0",
+	"description": "Standalone E2E Sanity Suite for Valors",
+	"main": "index.js",
+	"scripts": {
+		"test": "playwright test",
+		"report": "playwright show-report",
+		"typecheck": "tsc --noEmit"
+	},
+	"keywords": [
+		"playwright",
+		"e2e",
+		"testing",
+		"sanity"
+	],
+	"author": "",
+	"license": "ISC",
+	"devDependencies": {
+		"@commitlint/cli": "^20.5.0",
+		"@commitlint/config-conventional": "^20.5.0",
+		"@playwright/test": "^1.58.2",
+		"@types/ssh2": "^1.15.5",
+		"ssh2": "^1.17.0",
+		"typescript": "^5.9.3"
+	}
 }
