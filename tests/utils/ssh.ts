@@ -1,5 +1,4 @@
 import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { Client } from "ssh2";
 
 interface SSHConfig {
@@ -9,13 +8,46 @@ interface SSHConfig {
 	privateKeyPath: string;
 }
 
-function getSSHConfig(): SSHConfig {
+const REQUIRED_ENV_VARS = [
+	"RECCE_SSH_HOST",
+	"RECCE_SSH_PORT",
+	"RECCE_SSH_USER",
+	"RECCE_SSH_KEY_PATH",
+] as const;
+
+/**
+ * Build the SSH config strictly from environment variables.
+ * Throws when any required variable is missing — we never carry hardcoded
+ * production hosts/users/keypaths in source.
+ *
+ * Required env vars: RECCE_SSH_HOST, RECCE_SSH_PORT, RECCE_SSH_USER,
+ * RECCE_SSH_KEY_PATH.
+ *
+ * Exported for unit tests; production callers go through verifyLeadReceipt.
+ */
+export function getSSHConfig(): SSHConfig {
+	const missing = REQUIRED_ENV_VARS.filter((name) => !process.env[name]);
+	if (missing.length > 0) {
+		throw new Error(
+			`Missing required SSH env vars: ${missing.join(", ")}. ` +
+				`Set RECCE_SSH_HOST, RECCE_SSH_PORT, RECCE_SSH_USER, RECCE_SSH_KEY_PATH ` +
+				`before invoking SSH-based lead receipt verification.`,
+		);
+	}
+
+	const portRaw = process.env.RECCE_SSH_PORT as string;
+	const port = Number.parseInt(portRaw, 10);
+	if (!Number.isFinite(port) || port <= 0 || port > 65535) {
+		throw new Error(
+			`RECCE_SSH_PORT must be a valid TCP port (1-65535); got "${portRaw}".`,
+		);
+	}
+
 	return {
-		host: process.env.RECCE_SSH_HOST || "5.161.192.171",
-		port: parseInt(process.env.RECCE_SSH_PORT || "333", 10),
-		username: process.env.RECCE_SSH_USER || "kernelgnome",
-		privateKeyPath:
-			process.env.RECCE_SSH_KEY_PATH || `${homedir()}/.ssh/www_vps_key`,
+		host: process.env.RECCE_SSH_HOST as string,
+		port,
+		username: process.env.RECCE_SSH_USER as string,
+		privateKeyPath: process.env.RECCE_SSH_KEY_PATH as string,
 	};
 }
 
