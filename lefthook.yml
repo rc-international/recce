@@ -103,4 +103,7 @@ pre-push:
       run: bun audit 2>/dev/null || true
     companion-checks:
       # --foreground propagates signals to xargs child processes; --kill-after ensures cleanup if SIGTERM is ignored
-      run: timeout --kill-after=10 60 bun run companion:typecheck && BUN_TEST_WORKERS=3 timeout --foreground --kill-after=30 120 bun run companion:test
+      # Skip cleanly in repos that have no companion/ tree (e.g. recce).
+      run: |
+        if [ ! -d companion ]; then echo "no companion/ dir — skipping companion-checks"; exit 0; fi
+        timeout --kill-after=10 60 bun run companion:typecheck && BUN_TEST_WORKERS=3 timeout --foreground --kill-after=30 120 bun run companion:test
