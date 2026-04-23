@@ -100,7 +100,15 @@ pre-push:
     semgrep:
       run: 'command -v semgrep >/dev/null && semgrep --config auto --severity ERROR --quiet src/ wilco_cli/ scripts/ companion/web/src/ companion/web/server/ || echo "semgrep not installed, skipping"'
     security-audit:
-      run: bun audit 2>/dev/null || true
+      # Surface bun audit findings on push instead of swallowing them.
+      # If bun is not installed locally, skip cleanly; any other non-zero exit
+      # (i.e. real audit findings) blocks the push so the dev sees them.
+      run: |
+        if ! command -v bun >/dev/null; then
+          echo "bun not installed, skipping security-audit"
+          exit 0
+        fi
+        bun audit
     companion-checks:
       # --foreground propagates signals to xargs child processes; --kill-after ensures cleanup if SIGTERM is ignored
       # Skip cleanly in repos that have no companion/ tree (e.g. recce).

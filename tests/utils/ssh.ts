@@ -51,7 +51,21 @@ export function getSSHConfig(): SSHConfig {
 	};
 }
 
+// Strict allowlist for the email used inside the remote shell command.
+// We never want to pass arbitrary characters into `grep -l '<email>'` — quotes,
+// backticks, $(), ;, &, |, newlines, etc. could all break out of the literal.
+// The local-part allows the conservative subset of RFC 5321 that we actually use;
+// reject anything outside it before constructing the command.
+const SAFE_EMAIL_RE = /^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$/;
+
 export async function verifyLeadReceipt(email: string): Promise<boolean> {
+	if (!SAFE_EMAIL_RE.test(email)) {
+		throw new Error(
+			`verifyLeadReceipt: email "${email}" contains characters outside the ` +
+				`allowed set [A-Za-z0-9._%+-@]; refusing to build remote shell command.`,
+		);
+	}
+
 	const config = getSSHConfig();
 	const privateKey = readFileSync(config.privateKeyPath);
 
@@ -65,6 +79,9 @@ export async function verifyLeadReceipt(email: string): Promise<boolean> {
 
 		client
 			.on("ready", () => {
+				// Email is validated by SAFE_EMAIL_RE above, so direct interpolation
+				// inside single quotes is safe — the regex forbids the only character
+				// (single-quote) that could close the literal.
 				const cmd =
 					`find /var/lib/lead-details-api/leads/portal -name '*.json' ` +
 					`-mmin -5 -exec grep -l '${email}' {} \\; 2>/dev/null | head -1`;
