@@ -5,6 +5,7 @@ import { checkImages } from "./utils/checks/images";
 import { checkLinks } from "./utils/checks/links";
 import { createRuntimeErrorHook } from "./utils/checks/runtime-errors";
 import { checkSecurity } from "./utils/checks/security";
+import { checkSeo } from "./utils/checks/seo";
 import { crawl } from "./utils/crawler";
 import { recordFinding } from "./utils/findings";
 import type { Finding } from "./utils/types";
@@ -159,6 +160,18 @@ test.describe("Articles BFS crawl", () => {
 						await checkSecurity(p, { url, project });
 					} catch (e) {
 						console.debug(`[crawl-articles] checkSecurity ${url} failed:`, e);
+					}
+
+					// Phase 5b: SEO meta (locale-aware title, og, charset, BCP-47).
+					try {
+						await checkSeo(p, {
+							url,
+							project,
+							requestContext: p.context().request,
+							checkedLinks,
+						});
+					} catch (e) {
+						console.debug(`[crawl-articles] checkSeo ${url} failed:`, e);
 					}
 				},
 			],

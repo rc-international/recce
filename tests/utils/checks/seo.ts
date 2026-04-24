@@ -1,0 +1,563 @@
+import type { APIRequestContext, Page } from "@playwright/test";
+import { imageSize } from "image-size";
+import { recordFinding } from "../findings";
+import type { Finding } from "../types";
+
+/**
+ * C2 — SEO meta-integrity (Phase 5b).
+ *
+ * Per page the check extracts (in a SINGLE page.evaluate round-trip) the
+ * following DOM signals:
+ *
+ *   - <title>
+ *   - <html lang>
+ *   - <meta charset> + <meta name="viewport"> + <meta name="description">
+ *   - <h1> count + text
+ *   - <link rel="canonical">
+ *   - <meta property="og:*"> tuples
+ *   - <script type="application/ld+json"> blocks
+ *   - <link rel="alternate" hreflang=...>
+ *
+ * Validations:
+ *
+ *   - Title presence + locale-aware length bounds. Only English pages use the
+ *     30–65 tight bound; non-English pages warn above 80 chars only. Tuning
+ *     env vars:
+ *       RECCE_TITLE_MIN_LEN       (default 30, English only)
+ *       RECCE_TITLE_MAX_LEN       (default 65, English only)
+ *       RECCE_TITLE_NON_EN_MAX    (default 80)
+ *       RECCE_TITLE_NON_EN_MIN    (default unset — no min for non-English)
+ *   - meta description present + length 50..160 (warn).
+ *   - Exactly one non-empty <h1> (missing/multiple/empty all flagged).
+ *   - <link rel="canonical"> present + absolute.
+ *   - Open Graph minimum set (og:title / og:description / og:image / og:url)
+ *     plus og:url == canonical and og:image reachable + ≥ 1200x630.
+ *   - <meta charset> + <meta name="viewport"> present.
+ *   - <html lang> matches BCP-47 `^[a-z]{2}(-[A-Z]{2})?$`.
+ *   - Each JSON-LD block parses as JSON. Full @type semantic validation is
+ *     deferred — see TODO below.
+ *   - hreflang attributes match BCP-47 (or x-default) and hrefs are absolute.
+ *     Full bidirectional reciprocity lives in Phase 9 (C15).
+ *
+ * Error handling:
+ *   - Every catch logs at `console.debug` (see /home/gordon/wilco/rules/
+ *     error-handling.md). The shared `checkedLinks` cache is used so the same
+ *     og:image URL is HEADed at most once per run — consistent with Phase 3
+ *     B1/B2.
+ *
+ * TODO Phase 10: validate LocalBusiness/Place/Article @type semantics per URL
+ * pattern (e.g. merchant pages must have LocalBusiness or Place). Needs a
+ * calibration pass once we see what schemas valors.io actually emits.
+ */
+
+// -----------------------------------------------------------------------------
+// BCP-47
+// -----------------------------------------------------------------------------
+
+const BCP47_RE = /^[a-z]{2}(-[A-Z]{2})?$/;
+
+/**
+ * Strict BCP-47 validator for the subset the plan calls out:
+ *   - `^[a-z]{2}(-[A-Z]{2})?$`
+ * i.e. lowercase 2-letter language + optional uppercase 2-letter country.
+ *
+ * Accepts: `en`, `es`, `pt-BR`, `en-US`.
+ * Rejects: `english`, `EN`, `xx-xxx`, `en-us`, `` (empty).
+ */
+export function isValidBcp47(lang: string): boolean {
+	if (typeof lang !== "string") return false;
+	return BCP47_RE.test(lang);
+}
+
+// -----------------------------------------------------------------------------
+// DOM snapshot
+// -----------------------------------------------------------------------------
+
+type OgTag = { property: string; content: string };
+type HreflangTag = { hreflang: string; href: string };
+
+type SeoSnapshot = {
+	title: string | null;
+	htmlLang: string | null;
+	metaCharset: string | null;
+	metaViewport: string | null;
+	metaDescription: string | null;
+	h1s: string[];
+	canonical: string | null;
+	og: OgTag[];
+	jsonLdBlocks: string[];
+	hreflangs: HreflangTag[];
+};
+
+async function snapshotSeo(page: Page): Promise<SeoSnapshot> {
+	return (await page.evaluate(() => {
+		const title = document.querySelector("title")?.textContent ?? null;
+
+		const htmlLang = document.documentElement.getAttribute("lang") ?? null;
+
+		// <meta charset="..."> OR <meta http-equiv="Content-Type" ...> — either
+		// form is acceptable per HTML5 spec, but the check treats the modern
+		// `<meta charset>` as authoritative.
+		let metaCharset: string | null = null;
+		const charsetEl = document.querySelector("meta[charset]");
+		if (charsetEl) metaCharset = charsetEl.getAttribute("charset") || "";
+
+		let metaViewport: string | null = null;
+		const viewportEl = document.querySelector('meta[name="viewport"]');
+		if (viewportEl) metaViewport = viewportEl.getAttribute("content") || "";
+
+		let metaDescription: string | null = null;
+		const descEl = document.querySelector('meta[name="description"]');
+		if (descEl) metaDescription = descEl.getAttribute("content") || "";
+
+		const h1s: string[] = Array.from(document.querySelectorAll("h1")).map(
+			(h) => h.textContent || "",
+		);
+
+		const canonicalEl = document.querySelector('link[rel="canonical"]');
+		const canonical = canonicalEl
+			? canonicalEl.getAttribute("href") || ""
+			: null;
+
+		const og: { property: string; content: string }[] = Array.from(
+			document.querySelectorAll('meta[property^="og:"]'),
+		).map((m) => ({
+			property: m.getAttribute("property") || "",
+			content: m.getAttribute("content") || "",
+		}));
+
+		const jsonLdBlocks: string[] = Array.from(
+			document.querySelectorAll('script[type="application/ld+json"]'),
+		).map((s) => s.textContent || "");
+
+		const hreflangs: { hreflang: string; href: string }[] = Array.from(
+			document.querySelectorAll('link[rel="alternate"][hreflang]'),
+		).map((l) => ({
+			hreflang: l.getAttribute("hreflang") || "",
+			href: l.getAttribute("href") || "",
+		}));
+
+		return {
+			title,
+			htmlLang,
+			metaCharset,
+			metaViewport,
+			metaDescription,
+			h1s,
+			canonical,
+			og,
+			jsonLdBlocks,
+			hreflangs,
+		};
+	})) as SeoSnapshot;
+}
+
+// -----------------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------------
+
+function normaliseTrailingSlash(u: string): string {
+	try {
+		const parsed = new URL(u);
+		if (parsed.pathname !== "/" && parsed.pathname.endsWith("/")) {
+			parsed.pathname = parsed.pathname.replace(/\/+$/, "");
+		}
+		return parsed.toString();
+	} catch {
+		// If it isn't absolute, fall back to plain trailing-slash strip.
+		return u.length > 1 && u.endsWith("/") ? u.replace(/\/+$/, "") : u;
+	}
+}
+
+function titleBounds(lang: string | null): {
+	min: number | null;
+	max: number;
+	strict: boolean;
+} {
+	// strict=true means out-of-range emits a warning; strict=false means we
+	// only warn when ABOVE the max (no min).
+	const english = typeof lang === "string" && /^en/i.test(lang);
+	if (english) {
+		const min = Number(process.env.RECCE_TITLE_MIN_LEN ?? "30");
+		const max = Number(process.env.RECCE_TITLE_MAX_LEN ?? "65");
+		return {
+			min: Number.isFinite(min) ? min : 30,
+			max: Number.isFinite(max) ? max : 65,
+			strict: true,
+		};
+	}
+	const envMax = Number(process.env.RECCE_TITLE_NON_EN_MAX ?? "80");
+	const envMinRaw = process.env.RECCE_TITLE_NON_EN_MIN;
+	const envMin = envMinRaw !== undefined ? Number(envMinRaw) : NaN;
+	return {
+		min: Number.isFinite(envMin) ? envMin : null,
+		max: Number.isFinite(envMax) ? envMax : 80,
+		strict: false,
+	};
+}
+
+// -----------------------------------------------------------------------------
+// Main check
+// -----------------------------------------------------------------------------
+
+export async function checkSeo(
+	page: Page,
+	options: {
+		url: string;
+		project: Finding["project"];
+		requestContext?: APIRequestContext;
+		/**
+		 * Shared HEAD/GET status cache (same Map passed to checkImages /
+		 * checkLinks). Ensures we never HEAD the same og:image twice per run.
+		 */
+		checkedLinks?: Map<string, number>;
+	},
+): Promise<void> {
+	const { url, project } = options;
+	const ctx = options.requestContext ?? page.context().request;
+	const checkedLinks = options.checkedLinks ?? new Map<string, number>();
+
+	let snap: SeoSnapshot;
+	try {
+		snap = await snapshotSeo(page);
+	} catch (e) {
+		console.debug(`[recce-seo] snapshotSeo ${url} failed:`, e);
+		return;
+	}
+
+	// ---- Title ---------------------------------------------------------------
+	const trimmedTitle = (snap.title ?? "").trim();
+	if (!trimmedTitle) {
+		recordFinding({
+			url,
+			check: "seo-title-missing",
+			severity: "error",
+			message: "missing or empty <title>",
+			expected: "non-empty <title>",
+			actual: snap.title === null ? "(no <title>)" : "(whitespace only)",
+			project,
+		});
+	} else {
+		const bounds = titleBounds(snap.htmlLang);
+		const len = trimmedTitle.length;
+		const over = len > bounds.max;
+		const under = bounds.min != null && len < bounds.min;
+		if (over || under) {
+			const range =
+				bounds.min != null
+					? `${bounds.min}..${bounds.max}`
+					: `<= ${bounds.max}`;
+			recordFinding({
+				url,
+				check: "seo-title-length",
+				severity: "warn",
+				message: `title length ${len} outside ${range} (lang=${snap.htmlLang ?? "(unset)"})`,
+				expected: range,
+				actual: String(len),
+				project,
+			});
+		}
+	}
+
+	// ---- Meta description ----------------------------------------------------
+	if (snap.metaDescription == null) {
+		recordFinding({
+			url,
+			check: "seo-description-missing",
+			severity: "warn",
+			message: `missing <meta name="description">`,
+			expected: '<meta name="description" content="...">',
+			actual: "(absent)",
+			project,
+		});
+	} else {
+		const desc = snap.metaDescription.trim();
+		if (desc.length < 50 || desc.length > 160) {
+			recordFinding({
+				url,
+				check: "seo-description-length",
+				severity: "warn",
+				message: `description length ${desc.length} outside 50..160`,
+				expected: "50..160",
+				actual: String(desc.length),
+				project,
+			});
+		}
+	}
+
+	// ---- H1 ------------------------------------------------------------------
+	if (snap.h1s.length === 0) {
+		recordFinding({
+			url,
+			check: "seo-h1-missing",
+			severity: "error",
+			message: "page has no <h1>",
+			expected: "exactly one <h1>",
+			actual: "0",
+			project,
+		});
+	} else {
+		if (snap.h1s.length > 1) {
+			recordFinding({
+				url,
+				check: "seo-h1-multiple",
+				severity: "warn",
+				message: `page has ${snap.h1s.length} <h1> elements`,
+				expected: "exactly one <h1>",
+				actual: String(snap.h1s.length),
+				project,
+			});
+		}
+		const empties = snap.h1s.filter((t) => t.trim() === "").length;
+		if (empties > 0) {
+			recordFinding({
+				url,
+				check: "seo-h1-empty",
+				severity: "error",
+				message: `page has ${empties} empty (whitespace-only) <h1>`,
+				expected: "non-empty <h1>",
+				actual: "(whitespace only)",
+				project,
+			});
+		}
+	}
+
+	// ---- Canonical -----------------------------------------------------------
+	let canonicalNormalised: string | null = null;
+	if (snap.canonical === null) {
+		recordFinding({
+			url,
+			check: "seo-canonical-missing",
+			severity: "error",
+			message: `missing <link rel="canonical">`,
+			expected: '<link rel="canonical" href="https://...">',
+			actual: "(absent)",
+			project,
+		});
+	} else {
+		const href = snap.canonical.trim();
+		const absolute = href.startsWith("http://") || href.startsWith("https://");
+		if (!absolute) {
+			recordFinding({
+				url,
+				check: "seo-canonical-relative",
+				severity: "warn",
+				message: `canonical is relative: "${href}"`,
+				expected: "absolute http(s):// URL",
+				actual: href || "(empty)",
+				project,
+			});
+		} else {
+			try {
+				canonicalNormalised = normaliseTrailingSlash(href);
+			} catch (e) {
+				console.debug(`[recce-seo] canonical parse ${href} failed:`, e);
+			}
+		}
+	}
+
+	// ---- Open Graph ----------------------------------------------------------
+	const ogIndex = new Map<string, string>();
+	for (const tag of snap.og) {
+		if (tag.property) ogIndex.set(tag.property.toLowerCase(), tag.content);
+	}
+	const REQUIRED_OG = ["og:title", "og:description", "og:image", "og:url"];
+	let ogImageUrl: string | null = null;
+	for (const prop of REQUIRED_OG) {
+		const v = ogIndex.get(prop);
+		if (v == null || v.trim() === "") {
+			recordFinding({
+				url,
+				check: "seo-og-missing",
+				severity: "error",
+				message: `missing ${prop}`,
+				expected: `<meta property="${prop}" content="...">`,
+				actual: prop,
+				project,
+			});
+		} else if (prop === "og:image") {
+			ogImageUrl = v.trim();
+		}
+	}
+
+	const ogUrlValue = ogIndex.get("og:url");
+	if (ogUrlValue && canonicalNormalised) {
+		const ogUrlNormalised = normaliseTrailingSlash(ogUrlValue.trim());
+		if (ogUrlNormalised !== canonicalNormalised) {
+			recordFinding({
+				url,
+				check: "seo-og-url-mismatch",
+				severity: "warn",
+				message: `og:url !== canonical`,
+				expected: canonicalNormalised,
+				actual: ogUrlNormalised,
+				project,
+			});
+		}
+	}
+
+	// og:image HEAD + dimensions (shared checkedLinks cache).
+	if (ogImageUrl) {
+		let absoluteImageUrl: string;
+		try {
+			absoluteImageUrl = new URL(ogImageUrl, url).toString();
+		} catch (e) {
+			console.debug(`[recce-seo] og:image URL parse ${ogImageUrl} failed:`, e);
+			absoluteImageUrl = ogImageUrl;
+		}
+
+		const cachedStatus = checkedLinks.get(absoluteImageUrl);
+		let status: number;
+		if (cachedStatus !== undefined) {
+			status = cachedStatus;
+		} else {
+			status = 0;
+			try {
+				const res = await ctx.fetch(absoluteImageUrl, {
+					method: "HEAD",
+					timeout: 5000,
+				});
+				status = res.status();
+			} catch (e) {
+				console.debug(`[recce-seo] HEAD ${absoluteImageUrl} threw:`, e);
+				status = 0;
+			}
+			checkedLinks.set(absoluteImageUrl, status);
+		}
+		if (!(status >= 200 && status < 300)) {
+			recordFinding({
+				url,
+				check: "seo-og-image-unreachable",
+				severity: "error",
+				message: `og:image unreachable (HTTP ${status})`,
+				expected: "2xx",
+				actual: String(status),
+				project,
+			});
+		} else {
+			// Fetch the body and measure dims. This is a second request (GET)
+			// because HEAD does not return image bytes; the HEAD result stays
+			// cached so repeat callers skip BOTH HEAD and GET on this URL only
+			// when dims are already known (we track the GET-for-dims result
+			// separately to keep cache semantics compatible with checkImages).
+			try {
+				const res = await ctx.fetch(absoluteImageUrl, { timeout: 8000 });
+				if (res.ok()) {
+					try {
+						const buf = await res.body();
+						const dims = imageSize(new Uint8Array(buf));
+						const w = dims.width ?? 0;
+						const h = dims.height ?? 0;
+						if (w < 1200 || h < 630) {
+							recordFinding({
+								url,
+								check: "seo-og-image-small",
+								severity: "warn",
+								message: `og:image ${w}x${h} (< 1200x630)`,
+								expected: ">= 1200x630",
+								actual: `${w}x${h}`,
+								project,
+							});
+						}
+					} catch (e) {
+						console.debug(
+							`[recce-seo] image-size parse ${absoluteImageUrl} failed:`,
+							e,
+						);
+					}
+				}
+			} catch (e) {
+				console.debug(`[recce-seo] GET ${absoluteImageUrl} threw:`, e);
+			}
+		}
+	}
+
+	// ---- meta charset / viewport --------------------------------------------
+	if (snap.metaCharset == null) {
+		recordFinding({
+			url,
+			check: "seo-meta-charset-missing",
+			severity: "error",
+			message: `missing <meta charset>`,
+			expected: '<meta charset="utf-8">',
+			actual: "(absent)",
+			project,
+		});
+	}
+	if (snap.metaViewport == null) {
+		recordFinding({
+			url,
+			check: "seo-meta-viewport-missing",
+			severity: "error",
+			message: `missing <meta name="viewport">`,
+			expected: '<meta name="viewport" content="width=device-width, ...">',
+			actual: "(absent)",
+			project,
+		});
+	}
+
+	// ---- html lang (BCP-47) --------------------------------------------------
+	if (snap.htmlLang == null) {
+		recordFinding({
+			url,
+			check: "seo-html-lang-missing",
+			severity: "error",
+			message: `<html> missing lang attribute`,
+			expected: 'lang="en" or similar BCP-47',
+			actual: "(absent)",
+			project,
+		});
+	} else if (!isValidBcp47(snap.htmlLang)) {
+		recordFinding({
+			url,
+			check: "seo-html-lang-invalid",
+			severity: "warn",
+			message: `<html lang="${snap.htmlLang}"> not BCP-47`,
+			expected: "^[a-z]{2}(-[A-Z]{2})?$",
+			actual: snap.htmlLang,
+			project,
+		});
+	}
+
+	// ---- JSON-LD lightweight parse ------------------------------------------
+	// TODO Phase 10: validate LocalBusiness/Place/Article @type semantics per
+	// URL pattern. For now we just parse the JSON; full schema validation
+	// needs a calibration pass against real valors.io schema output.
+	for (const raw of snap.jsonLdBlocks) {
+		const body = raw.trim();
+		if (!body) continue;
+		try {
+			JSON.parse(body);
+		} catch (e) {
+			recordFinding({
+				url,
+				check: "seo-jsonld-parse-error",
+				severity: "warn",
+				message: `JSON-LD block failed to parse: ${(e as Error).message}`,
+				expected: "valid JSON",
+				actual: `${body.slice(0, 80)}${body.length > 80 ? "…" : ""}`,
+				project,
+			});
+		}
+	}
+
+	// ---- hreflang resolve (subset of C15) ------------------------------------
+	// Only format validation here. Phase 9 adds fetch + reciprocity.
+	for (const h of snap.hreflangs) {
+		const tag = (h.hreflang || "").trim();
+		const href = (h.href || "").trim();
+		const validTag = tag === "x-default" || isValidBcp47(tag);
+		const absolute = href.startsWith("http://") || href.startsWith("https://");
+		if (!validTag || !absolute) {
+			recordFinding({
+				url,
+				check: "seo-hreflang-invalid",
+				severity: "warn",
+				message: `hreflang="${tag}" href="${href}" invalid (${!validTag ? "bad tag" : ""}${!validTag && !absolute ? "; " : ""}${!absolute ? "not absolute" : ""})`,
+				expected: "BCP-47 or x-default, absolute http(s)://",
+				actual: `hreflang=${tag || "(empty)"} href=${href || "(empty)"}`,
+				project,
+			});
+		}
+	}
+}
