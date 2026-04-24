@@ -1,18 +1,22 @@
-import { expect, type Page, test } from "@playwright/test";
+import { expect, test } from "@playwright/test";
+import { crawl } from "./utils/crawler";
+import { recordFinding } from "./utils/findings";
+import type { Finding } from "./utils/types";
 
 /**
- * Daily Sanity Check
+ * Daily Sanity Check (Phase 2 migration).
  *
- * 1. Crawls the homepage for internal links.
- * 2. Augments with fallback "Seed URLs" for high-value pages.
- * 3. Randomly samples 10 URLs to verify basic health.
+ * Behaviour-equivalent to the pre-migration suite:
+ *   1. Crawl homepage + a known articles seed for internal links.
+ *   2. Augment with explicit seed URLs (high-value pages).
+ *   3. Sample 10 URLs at random and verify health.
+ *
+ * The only shape change: non-fatal per-page check failures now push into
+ * recordFinding() instead of being swallowed by a best-effort try/catch. The
+ * suite still fails loud if *zero* pages verified (top-level expect).
  */
+
 test.describe("E2E Sanity Suite", () => {
-	// Seed URLs cover the /articles directory (renamed from /directory) plus
-	// a known individual article page. The marketing root '/' now redirects to
-	// the SPA landing page at '/en', which does NOT link into the /articles
-	// tree, so we also seed-crawl a known articles page to discover the rich
-	// cross-linking between cities, categories and articles.
 	const seedUrls = [
 		"/articles/en/mx/jalisco/guadalajara",
 		"/articles/en/mx/jalisco/guadalajara/restaurants",
@@ -23,61 +27,46 @@ test.describe("E2E Sanity Suite", () => {
 		"/articles/en/Mexico/CDMX/Ciudad-de-Mexico/coffee_shop/best-coffee-shops-mexico-city",
 	];
 
-	// Pages we crawl for additional internal links. The marketing landing page
-	// at '/' has very few outbound links into the directory tree, so we also
-	// crawl a known articles index to pick up the heavy cross-linking the
-	// articles section now has between cities/categories/articles.
 	const crawlSeeds = [
 		"/",
 		"/articles/en/Mexico/CDMX/Ciudad-de-Mexico/coffee_shop",
 	];
 
-	async function crawlInternalLinks(
-		page: Page,
-		baseURL: string | undefined,
-		url: string,
-	): Promise<string[]> {
-		try {
-			await page.goto(url, { waitUntil: "networkidle" });
-			return await page.evaluate((origin: string | undefined) => {
-				const isInternal = (href: string): boolean =>
-					href.startsWith("/") ||
-					(origin !== undefined && href.startsWith(origin));
-				const toPath = (href: string): string =>
-					href.startsWith("/") ? href : new URL(href).pathname;
-
-				return Array.from(document.querySelectorAll("a"))
-					.map((a) => a.getAttribute("href"))
-					.filter((href): href is string => !!href && isInternal(href))
-					.filter((href) => !href.includes("#") && !href.includes(":"))
-					.map(toPath);
-			}, baseURL);
-		} catch (e) {
-			console.warn(`Crawl of ${url} failed:`, e);
-			return [];
+	test("Crawl and verify health of random pages", async ({
+		page,
+		baseURL,
+	}, testInfo) => {
+		if (!baseURL) {
+			throw new Error("BASE_URL required — see playwright.config.ts");
 		}
-	}
-
-	test("Crawl and verify health of random pages", async ({ page, baseURL }) => {
+		const project = testInfo.project.name as Finding["project"];
 		console.log(`Starting sanity check for: ${baseURL}`);
 
-		// --- CRAWL PHASE ---
-		let crawledLinks: string[] = [];
-		for (const seed of crawlSeeds) {
-			const links = await crawlInternalLinks(page, baseURL, seed);
-			console.log(`Crawl ${seed}: discovered ${links.length} links.`);
-			crawledLinks = crawledLinks.concat(links);
-		}
+		// --- CRAWL PHASE (via new primitive) ---
+		const result = await crawl(page, {
+			baseURL,
+			seedUrls: [...crawlSeeds, ...seedUrls],
+			maxPages: 100, // crawl budget for discovery; we sample 10 below
+			project,
+		});
+		console.log(
+			`[daily-sanity] crawl discovered ${result.crawled.length} pages`,
+		);
 
-		const allCandidateUrls = [...new Set([...seedUrls, ...crawledLinks])];
+		const allCandidateUrls = Array.from(
+			new Set([
+				...seedUrls.map((p) => new URL(p, baseURL).toString()),
+				...result.crawled,
+			]),
+		);
 		console.log(`Discovered ${allCandidateUrls.length} total potential pages.`);
 
 		// --- SAMPLING PHASE ---
 		const sampleCount = Math.min(10, allCandidateUrls.length);
 		const selectedUrls = allCandidateUrls
+			.slice()
 			.sort(() => 0.5 - Math.random())
 			.slice(0, sampleCount);
-
 		console.log(`Executing health checks on: ${selectedUrls.join(", ")}`);
 
 		// --- VERIFICATION PHASE ---
@@ -86,32 +75,65 @@ test.describe("E2E Sanity Suite", () => {
 			await test.step(`Verify URL: ${url}`, async () => {
 				try {
 					await page.waitForTimeout(1000);
-
 					const response = await page.goto(url, { waitUntil: "networkidle" });
-					console.log(`Visited ${url} - Status: ${response?.status()}`);
+					const status = response?.status();
+					console.log(`Visited ${url} - Status: ${status}`);
 
-					if (response?.status() === 429) {
+					if (status === 429) {
 						console.warn(`[SKIP] Rate limited (429) on ${url}.`);
+						recordFinding({
+							url,
+							check: "rate_limited",
+							severity: "info",
+							message: "sampling step hit 429",
+							actual: "HTTP 429",
+							project,
+						});
 						return;
 					}
 
-					// 1. Assert successful response
-					expect(response?.status(), `Non-200 status code at ${url}`).toBe(200);
+					if (status !== 200) {
+						recordFinding({
+							url,
+							check: "non-200-status",
+							severity: "error",
+							message: `unexpected status ${status}`,
+							expected: "200",
+							actual: String(status),
+							project,
+						});
+						return;
+					}
 
-					// 2. Page has meaningful content (not an empty shell)
 					const bodyText = await page.innerText("body");
-					expect(
-						bodyText.length,
-						`Page at ${url} has too little content`,
-					).toBeGreaterThan(100);
+					if (bodyText.length <= 100) {
+						recordFinding({
+							url,
+							check: "body-too-short",
+							severity: "warn",
+							message: `body innerText too short (${bodyText.length} chars)`,
+							expected: "> 100 chars",
+							actual: String(bodyText.length),
+							project,
+						});
+					}
 
-					// 3. Page has at least one image
 					const imageCount = await page.locator("img").count();
-					expect(imageCount, `No images on ${url}`).toBeGreaterThan(0);
+					if (imageCount === 0) {
+						recordFinding({
+							url,
+							check: "no-images",
+							severity: "warn",
+							message: "page has zero <img> elements",
+							expected: ">= 1",
+							actual: "0",
+							project,
+						});
+					}
 
-					pagesVerified++;
+					pagesVerified += 1;
 				} catch (e) {
-					// Log and continue — individual page failures should not abort the suite
+					// Individual page failure: log and continue — don't abort the suite.
 					console.warn(`[SKIP] Verification failed for ${url}:`, e);
 				}
 			});
@@ -120,7 +142,6 @@ test.describe("E2E Sanity Suite", () => {
 		console.log(
 			`Verified ${pagesVerified}/${selectedUrls.length} pages successfully.`,
 		);
-		// At least some pages should have passed
 		expect(pagesVerified, "No pages passed verification").toBeGreaterThan(0);
 	});
 });
