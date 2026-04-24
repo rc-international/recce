@@ -119,6 +119,74 @@ const FIXTURES: Record<string, FixtureBody> = {
 			</script>
 		</body></html>`,
 	},
+
+	// ---- Phase 5a fixtures (C3 + C4 + C7 + C8) --------------------------------
+
+	// C3: script that throws synchronously during parse -> pageerror event.
+	pageerror: {
+		contentType: "text/html; charset=utf-8",
+		body: `<!doctype html><html><head><title>Seeded pageerror</title></head><body>
+			<h1>Seeded pageerror</h1>
+			<script>throw new Error('seeded pageerror')</script>
+		</body></html>`,
+	},
+
+	// C3: console.error during load.
+	"console-error": {
+		contentType: "text/html; charset=utf-8",
+		body: `<!doctype html><html><head><title>Seeded console-error</title></head><body>
+			<h1>Seeded console error</h1>
+			<script>console.error('seeded console error')</script>
+		</body></html>`,
+	},
+
+	// C3: request that will fail. The page references definitely-404.jpg which
+	// the installer intercepts and returns an aborted response for.
+	requestfailed: html(
+		`<main><h1>Request failed</h1>
+			<img src="/__recce_test/definitely-404.jpg" alt="will fail">
+		</main>`,
+		"Seeded requestfailed",
+	),
+
+	// C4: unresolved Handlebars in visible body text.
+	"content-handlebars": html(
+		`<main><h1>Hello</h1><p>Welcome {{user.name}}</p></main>`,
+		"Seeded content-handlebars",
+	),
+
+	// C4: visible 'undefined' literal.
+	"content-undefined": html(
+		`<main><h1>Product</h1><p>Price: undefined</p></main>`,
+		"Seeded content-undefined",
+	),
+
+	// C4: visible '[object Object]' literal.
+	"content-object-object": html(
+		`<main><h1>Data</h1><p>[object Object]</p></main>`,
+		"Seeded content-object-object",
+	),
+
+	// C4: empty H1 (whitespace only).
+	"content-empty-h1": html(
+		`<main><h1> </h1><p>body content</p></main>`,
+		"Seeded content-empty-h1",
+	),
+
+	// C7: target="_blank" without rel="noopener".
+	"noopener-missing": html(
+		`<main><h1>Link</h1><a target="_blank" href="https://external.example/">external</a></main>`,
+		"Seeded noopener-missing",
+	),
+
+	// C8: mixed content image on https origin — the fixture returns the HTML
+	// with a plain http:// img src. The test asserts the finding when the
+	// page URL is https (tests can synthesise the origin via setContent rather
+	// than relying on the fixture server).
+	"mixed-content": html(
+		`<main><h1>Mixed</h1><img src="http://insecure.example/pic.jpg" alt="insecure"></main>`,
+		"Seeded mixed-content",
+	),
 };
 
 /**
@@ -131,6 +199,12 @@ export async function installSeededBugs(page: Page): Promise<void> {
 		try {
 			const url = new URL(route.request().url());
 			const key = url.pathname.replace(FIXTURE_PREFIX, "");
+			// C3 requestfailed fixture: abort the image request so Playwright
+			// fires the `requestfailed` event rather than returning a status.
+			if (key === "definitely-404.jpg") {
+				await route.abort("failed");
+				return;
+			}
 			const fixture = FIXTURES[key];
 			if (!fixture) {
 				await route.fulfill({

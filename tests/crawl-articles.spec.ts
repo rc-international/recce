@@ -1,7 +1,10 @@
 import { expect, type Page, test } from "@playwright/test";
 import { checkButtons } from "./utils/checks/buttons";
+import { checkContentQuality } from "./utils/checks/content";
 import { checkImages } from "./utils/checks/images";
 import { checkLinks } from "./utils/checks/links";
+import { createRuntimeErrorHook } from "./utils/checks/runtime-errors";
+import { checkSecurity } from "./utils/checks/security";
 import { crawl } from "./utils/crawler";
 import { recordFinding } from "./utils/findings";
 import type { Finding } from "./utils/types";
@@ -42,14 +45,39 @@ test.describe("Articles BFS crawl", () => {
 			soft404Checked: new Set<string>(),
 		};
 
+		// Current-URL ref updated by the per-page check before each check body
+		// runs. The runtime-error hook attaches listeners once (via pageHooks,
+		// BEFORE the first goto) and reads urlRef.value inside every event
+		// callback so findings are tagged with the page under test.
+		const urlRef = { value: "" };
+
 		const result = await crawl(page, {
 			baseURL,
 			seedUrls: crawlSeeds,
 			maxPages: 25,
 			project,
+			pageHooks: [
+				// Attach runtime listeners ONCE on first invocation (the crawler
+				// reuses a single Page across all navigations — attaching each time
+				// would duplicate findings). The crawler types pageHooks as
+				// `(page: PageLike, url) => ...` for unit-test stubbability; the
+				// runtime-error hook needs the full Playwright `Page` for
+				// `page.on(...)`. In production the crawler always passes a real
+				// Page so the cast is safe.
+				(() => {
+					const hook = createRuntimeErrorHook(() => urlRef.value, project);
+					let installed = false;
+					return async (pl: unknown) => {
+						if (installed) return;
+						installed = true;
+						await hook(pl as Page);
+					};
+				})(),
+			],
 			perPageChecks: [
 				async (pl, url) => {
 					const p = pl as Page;
+					urlRef.value = url;
 					soft404Context.visited.add(url);
 
 					// Keep the lightweight phase-2 smoke checks.
@@ -115,6 +143,22 @@ test.describe("Articles BFS crawl", () => {
 						});
 					} catch (e) {
 						console.debug(`[crawl-articles] checkLinks ${url} failed:`, e);
+					}
+
+					// Phase 5a: content + security.
+					try {
+						await checkContentQuality(p, { url, project });
+					} catch (e) {
+						console.debug(
+							`[crawl-articles] checkContentQuality ${url} failed:`,
+							e,
+						);
+					}
+
+					try {
+						await checkSecurity(p, { url, project });
+					} catch (e) {
+						console.debug(`[crawl-articles] checkSecurity ${url} failed:`, e);
 					}
 				},
 			],

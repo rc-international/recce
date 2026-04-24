@@ -1,7 +1,10 @@
 import { expect, type Page, test } from "@playwright/test";
 import { checkButtons } from "./utils/checks/buttons";
+import { checkContentQuality } from "./utils/checks/content";
 import { checkImages } from "./utils/checks/images";
 import { checkLinks } from "./utils/checks/links";
+import { createRuntimeErrorHook } from "./utils/checks/runtime-errors";
+import { checkSecurity } from "./utils/checks/security";
 import { recordSelectorHit } from "./utils/checks/selector-health";
 import { crawl } from "./utils/crawler";
 import { recordFinding } from "./utils/findings";
@@ -68,6 +71,11 @@ test.describe("Merchants BFS crawl (B3)", () => {
 			soft404Checked: new Set<string>(),
 		};
 
+		// Current-URL ref updated before each per-page check body so the
+		// runtime-error hook (installed once pre-navigation) can tag findings
+		// with the page under test.
+		const urlRef = { value: "" };
+
 		let merchantsChecked = 0;
 
 		const result = await crawl(page, {
@@ -75,9 +83,23 @@ test.describe("Merchants BFS crawl (B3)", () => {
 			seedUrls: crawlSeeds,
 			maxPages: mode === "audit" ? 2000 : 50,
 			project,
+			pageHooks: [
+				// See crawl-articles.spec.ts for rationale — attach listeners once,
+				// cast PageLike -> Page safely in production.
+				(() => {
+					const hook = createRuntimeErrorHook(() => urlRef.value, project);
+					let installed = false;
+					return async (pl: unknown) => {
+						if (installed) return;
+						installed = true;
+						await hook(pl as Page);
+					};
+				})(),
+			],
 			perPageChecks: [
 				async (pl, url) => {
 					const p = pl as Page;
+					urlRef.value = url;
 					soft404Context.visited.add(url);
 					if (!isMerchantPath(url)) return;
 					if (merchantsChecked >= maxMerchants) return;
@@ -237,6 +259,22 @@ test.describe("Merchants BFS crawl (B3)", () => {
 						});
 					} catch (e) {
 						console.debug(`[crawl-merchants] checkLinks ${url} failed:`, e);
+					}
+
+					// Phase 5a: content + security.
+					try {
+						await checkContentQuality(p, { url, project });
+					} catch (e) {
+						console.debug(
+							`[crawl-merchants] checkContentQuality ${url} failed:`,
+							e,
+						);
+					}
+
+					try {
+						await checkSecurity(p, { url, project });
+					} catch (e) {
+						console.debug(`[crawl-merchants] checkSecurity ${url} failed:`, e);
 					}
 				},
 			],
