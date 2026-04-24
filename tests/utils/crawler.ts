@@ -1,9 +1,9 @@
-import { execSync } from "node:child_process";
 import { gunzipSync } from "node:zlib";
 import type { Page } from "@playwright/test";
 import { XMLParser } from "fast-xml-parser";
 import { recordFinding } from "./findings";
 import type { Finding } from "./types";
+import { safeWilcoNotify } from "./wilco-notify";
 
 /**
  * Recce crawler primitive.
@@ -65,6 +65,17 @@ export type CrawlResult = {
 const DEFAULT_MAX_DEPTH = Number(process.env.MAX_DEPTH ?? "7");
 const DEFAULT_MAX_PAGES_PULSE = 50;
 const DEFAULT_MAX_PAGES_AUDIT = 2000;
+/**
+ * Env-level override of per-mode max pages. `run-audit.sh` sets this to 2000
+ * by default but ops can lower it for debugging without editing the crawler.
+ * Parsed once at module load.
+ */
+const MAX_PAGES_ENV_OVERRIDE: number | null = (() => {
+	const raw = process.env.MAX_PAGES;
+	if (!raw) return null;
+	const n = Number(raw);
+	return Number.isFinite(n) && n > 0 ? Math.floor(n) : null;
+})();
 const DEFAULT_CONCURRENCY = Math.max(
 	1,
 	Math.min(2, Number(process.env.CRAWL_CONCURRENCY ?? "2")),
@@ -161,13 +172,11 @@ function emitSitemapFailure(
 		});
 	} catch (e) {
 		console.warn(`[recce-crawler] recordFinding failed for ${url}:`, e);
-		try {
-			execSync(
-				`wilco-notify --level warning --title "Recce sitemap parse failed" "${message.replace(/"/g, "'")}"`,
-			);
-		} catch (notifyErr) {
-			console.debug(`[recce-crawler] wilco-notify failed:`, notifyErr);
-		}
+		safeWilcoNotify(message, {
+			level: "warning",
+			title: "Recce sitemap parse failed",
+			logPrefix: "recce-crawler",
+		});
 	}
 }
 
@@ -418,8 +427,12 @@ export async function crawl(
 	config: CrawlerConfig,
 ): Promise<CrawlResult> {
 	const mode = (process.env.RECCE_MODE as "pulse" | "audit") || "pulse";
-	const maxPagesDefault =
+	const maxPagesModeDefault =
 		mode === "audit" ? DEFAULT_MAX_PAGES_AUDIT : DEFAULT_MAX_PAGES_PULSE;
+	// Env override wins over the per-mode default but NOT over an explicit
+	// config.maxPages (callers like pulse specs may hardcode e.g. 25 for the
+	// 5-minute budget).
+	const maxPagesDefault = MAX_PAGES_ENV_OVERRIDE ?? maxPagesModeDefault;
 	const maxDepth = config.maxDepth ?? DEFAULT_MAX_DEPTH;
 	const maxPages = config.maxPages ?? maxPagesDefault;
 	const fetcher = config.fetcher ?? defaultFetcher;
@@ -433,13 +446,11 @@ export async function crawl(
 		sitemapSeeds = await discoverSeeds(config.baseURL, fetcher, project);
 	} catch (e) {
 		console.warn(`[recce-crawler] sitemap discovery threw:`, e);
-		try {
-			execSync(
-				`wilco-notify --level warning --title "Recce sitemap discovery threw" "${(e as Error).message.replace(/"/g, "'")}"`,
-			);
-		} catch (notifyErr) {
-			console.debug(`[recce-crawler] wilco-notify failed:`, notifyErr);
-		}
+		safeWilcoNotify((e as Error).message, {
+			level: "warning",
+			title: "Recce sitemap discovery threw",
+			logPrefix: "recce-crawler",
+		});
 	}
 
 	// Compose starting queue: sitemap locs + configured seeds (deduped).
@@ -560,13 +571,11 @@ export async function crawl(
 						e,
 					);
 				}
-				try {
-					execSync(
-						`wilco-notify --level error --title "Recce crawl aborted — rate-limited" "${rateLimited} 429s on ${config.baseURL}"`,
-					);
-				} catch (e) {
-					console.debug(`[recce-crawler] wilco-notify failed:`, e);
-				}
+				safeWilcoNotify(`${rateLimited} 429s on ${config.baseURL}`, {
+					level: "error",
+					title: "Recce crawl aborted — rate-limited",
+					logPrefix: "recce-crawler",
+				});
 			}
 			return;
 		}

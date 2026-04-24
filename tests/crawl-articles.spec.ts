@@ -38,6 +38,12 @@ test.describe("Articles BFS crawl", () => {
 			throw new Error("BASE_URL required — see playwright.config.ts");
 		}
 		const project = testInfo.project.name as Finding["project"];
+		const mode = (process.env.RECCE_MODE as "pulse" | "audit") || "pulse";
+		// Pulse hardcodes 25 to stay inside the 5-minute daily-sanity budget.
+		// Audit defers to the crawler defaults (DEFAULT_MAX_PAGES_AUDIT=2000,
+		// or MAX_PAGES env override from run-audit.sh) by leaving maxPages
+		// undefined so ops can tune without editing the spec.
+		const maxPages = mode === "audit" ? undefined : 25;
 
 		// Shared caches across B1/B2 for this crawl run.
 		const checkedLinks = new Map<string, number>();
@@ -55,7 +61,7 @@ test.describe("Articles BFS crawl", () => {
 		const result = await crawl(page, {
 			baseURL,
 			seedUrls: crawlSeeds,
-			maxPages: 25,
+			maxPages,
 			project,
 			pageHooks: [
 				// Attach runtime listeners ONCE on first invocation (the crawler

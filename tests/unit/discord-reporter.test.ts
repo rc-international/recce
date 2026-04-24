@@ -382,6 +382,87 @@ describe("discord-reporter: live-fire webhook POST", () => {
 		}
 	});
 
+	test("external-upload fallback — when paste host fails, downgrade to inline with top-N URLs", async () => {
+		// Regression guard. Prior version:
+		//   - set finalPlan.mode = "external-upload" after paste host failure,
+		//     which caused the multipart/attach branch to attempt upload of a
+		//     file we already said was too large;
+		//   - never appended the top-N failing URLs, so on paste-host outage
+		//     the Discord report carried ONLY the ATTENTION banner with no
+		//     actionable URL list — the exact silent-failure the reporter was
+		//     designed to prevent.
+		//
+		// New semantics: paste-host null → downgrade to "inline" mode +
+		// ATTENTION banner + top-N URL list embedded in the JSON payload.
+		const received: Array<{ body: string; contentType: string | null }> = [];
+		const server = Bun.serve({
+			port: 0,
+			async fetch(req) {
+				const ct = req.headers.get("content-type");
+				const body = await req.text();
+				received.push({ body, contentType: ct });
+				return new Response("{}", { status: 200 });
+			},
+		});
+		try {
+			const webhook = `http://127.0.0.1:${server.port}/webhook`;
+			process.env.RECCE_DISCORD_WEBHOOK = webhook;
+			process.env.BASE_URL = "https://valors.io";
+
+			const artifact = makeArtifact({ errors: 15, failingUrls: 15 });
+			const artifactPath = path.join(
+				workDir,
+				"test-results",
+				"findings",
+				"findings-latest.json",
+			);
+			const padding = "x".repeat(EXTERNAL_UPLOAD_THRESHOLD_BYTES + 1024);
+			const fatArtifact = { ...artifact, _padding: padding };
+			writeFileSync(artifactPath, JSON.stringify(fatArtifact), "utf8");
+
+			const { deliverReport } = await import("../utils/discord-reporter");
+			const result = await deliverReport({
+				webhookUrl: webhook,
+				artifact,
+				artifactPath,
+				suiteSummary: {
+					passed: 10,
+					failed: 15,
+					skipped: 0,
+					totalDurationSec: "5.0",
+					baseURL: "https://valors.io",
+					hasRecaptcha: true,
+				},
+				failureDetails: [],
+				// Simulate paste host outage — uploader returns null.
+				externalUploader: async (_p: string) => null,
+				escalate: false,
+			});
+			expect(result.delivered).toBe(true);
+			// Downgraded from external-upload → inline so the JSON payload flows.
+			expect(result.mode).toBe("inline");
+			expect(received).toHaveLength(1);
+			expect(received[0].contentType).toContain("application/json");
+			// Verify the embed carries BOTH the ATTENTION banner AND the top
+			// URL list. Without the list, ops sees only "upload failed" — the
+			// silent-report regression we're guarding against.
+			const payload = JSON.parse(received[0].body);
+			const findingsEmbed = payload.embeds[1];
+			const fieldNames = (findingsEmbed.fields ?? []).map(
+				(f: { name: string }) => f.name,
+			);
+			expect(fieldNames).toContain("ATTENTION");
+			expect(fieldNames).toContain("Top failing URLs");
+			const topField = findingsEmbed.fields.find(
+				(f: { name: string }) => f.name === "Top failing URLs",
+			);
+			// First failing URL must appear in the rendered list.
+			expect(topField.value).toContain("https://valors.io/p/0");
+		} finally {
+			server.stop(true);
+		}
+	});
+
 	test("webhook 500 triggers delivered=false and escalation reason", async () => {
 		const server = Bun.serve({
 			port: 0,

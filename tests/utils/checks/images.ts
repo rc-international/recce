@@ -1,6 +1,7 @@
 import type { Page } from "@playwright/test";
 import { recordFinding } from "../findings";
 import type { Finding } from "../types";
+import { headOrGet } from "./net";
 
 /**
  * B1 (broken / missing) + B4 (duplicate) + CLS dimension + oversized image
@@ -226,37 +227,6 @@ async function collectImages(page: Page): Promise<ImageInfo[]> {
 	return raw as ImageInfo[];
 }
 
-async function headOrGet(
-	page: Page,
-	target: string,
-	cache: Map<string, number>,
-): Promise<number> {
-	const cached = cache.get(target);
-	if (cached !== undefined) return cached;
-
-	const ctx = page.context();
-	let status = 0;
-	try {
-		const res = await ctx.request.head(target, { timeout: 5000 });
-		status = res.status();
-		if (status === 405 || status === 501) {
-			const r2 = await ctx.request.get(target, { timeout: 5000 });
-			status = r2.status();
-		}
-	} catch (e) {
-		console.debug(`[recce-images] HEAD ${target} threw:`, e);
-		try {
-			const r3 = await ctx.request.get(target, { timeout: 5000 });
-			status = r3.status();
-		} catch (e2) {
-			console.debug(`[recce-images] GET fallback ${target} threw:`, e2);
-			status = 0;
-		}
-	}
-	cache.set(target, status);
-	return status;
-}
-
 /**
  * Run B1 + B4 + CLS + oversized checks on the current page state.
  *
@@ -328,9 +298,21 @@ export async function checkImages(
 		}
 
 		// HEAD check on currentSrc for non-broken images.
+		//
+		// CRITICAL: `key` is the CDN-normalised cache key (query-stripped for
+		// known CDN hosts); `img.currentSrc` is the actual URL we must HEAD.
+		// Fetching the stripped key causes spurious 403/404s on CDN transform
+		// URLs (e.g. `cdn.sanity.io/.../x.jpg?w=800` succeeds, but bare
+		// `cdn.sanity.io/.../x.jpg` may 403). Pass both to headOrGet so dedup
+		// happens on key while the network request targets currentSrc.
 		if (img.currentSrc && /^https?:/i.test(img.currentSrc)) {
 			const key = normaliseImageUrl(img.currentSrc);
-			const status = await headOrGet(page, key, checkedLinks);
+			const status = await headOrGet(
+				page.context().request,
+				img.currentSrc,
+				key,
+				checkedLinks,
+			);
 			if (status && (status < 200 || status >= 300)) {
 				recordFinding({
 					url,

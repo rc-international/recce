@@ -1,4 +1,4 @@
-import { execSync, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import type {
@@ -11,6 +11,7 @@ import type {
 } from "@playwright/test/reporter";
 import { getLatestJsonPath } from "./findings";
 import type { Finding, FindingsArtifact } from "./types";
+import { safeWilcoNotify } from "./wilco-notify";
 
 /**
  * Recce Discord reporter (Phase 4).
@@ -236,8 +237,11 @@ export async function deliverReport(
 				inline: false,
 			});
 		} else {
-			// Fallback — inline the top-10 URLs plus a truncation banner so the
-			// report is not silently lost. Downgrade to inline mode.
+			// Fallback — paste host down. Inline the top-N failing URLs and an
+			// ATTENTION banner so the report is NOT silently lost. Downgrade the
+			// delivery mode to "inline" so the POST path below sends a JSON
+			// webhook (not a multipart attach, which would require an attachment
+			// path we don't have at this size).
 			console.warn(
 				`[recce-discord] external upload failed; falling back to truncated inline`,
 			);
@@ -245,10 +249,22 @@ export async function deliverReport(
 				name: "ATTENTION",
 				value:
 					`findings JSON too large (${(fileSizeBytes / (1024 * 1024)).toFixed(1)} MB) ` +
-					`and external upload failed — showing top ${plan.topFailingUrls.length} URLs only`,
+					`and external upload failed — showing top ${plan.topFailingUrls.length} failing URL(s) only. ` +
+					`Full findings remain on disk at ${artifactPath}`,
 				inline: false,
 			});
-			finalPlan = { ...plan, mode: "external-upload" }; // keep classification
+			if (plan.topFailingUrls.length > 0) {
+				const lines = plan.topFailingUrls.map(
+					(s) =>
+						`• ${s.url} — ${s.errors}e/${s.warns}w [${Array.from(s.checks).slice(0, 3).join(",")}]`,
+				);
+				findingsEmbed.fields = appendField(findingsEmbed.fields, {
+					name: "Top failing URLs",
+					value: lines.join("\n").slice(0, 1024),
+					inline: false,
+				});
+			}
+			finalPlan = { ...plan, mode: "inline" };
 		}
 	}
 
@@ -422,17 +438,11 @@ function buildFindingsEmbed(
 
 function escalateDeliveryFailure(reason: string, findingsPath: string): void {
 	const msg = `Recce Discord delivery failed: ${reason} (findings: ${findingsPath})`;
-	try {
-		execSync(
-			`wilco-notify --level error --title "Recce Discord delivery failed" ${JSON.stringify(msg)}`,
-			{ stdio: "ignore" },
-		);
-	} catch (e) {
-		console.error(
-			`[recce-discord] wilco-notify escalation failed (likely not installed):`,
-			e,
-		);
-	}
+	safeWilcoNotify(msg, {
+		level: "error",
+		title: "Recce Discord delivery failed",
+		logPrefix: "recce-discord",
+	});
 }
 
 // ---------------------------------------------------------------------------
@@ -498,17 +508,11 @@ class DiscordReporter implements Reporter {
 		if (!artifact && passed > 0 && !process.env.RECCE_TEARDOWN_ESCALATED) {
 			const msg = `Recce findings-latest.json absent despite ${passed} passing tests`;
 			console.error(`[recce-discord] ${msg}`);
-			try {
-				execSync(
-					`wilco-notify --level error --title "Recce findings missing" ${JSON.stringify(msg)}`,
-					{ stdio: "ignore" },
-				);
-			} catch (e) {
-				console.error(
-					`[recce-discord] wilco-notify escalation failed (likely not installed):`,
-					e,
-				);
-			}
+			safeWilcoNotify(msg, {
+				level: "error",
+				title: "Recce findings missing",
+				logPrefix: "recce-discord",
+			});
 		}
 
 		// If no artifact, post a bare suite-summary message rather than skip.

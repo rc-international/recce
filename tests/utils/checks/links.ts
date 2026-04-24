@@ -1,6 +1,7 @@
 import type { APIRequestContext, Page } from "@playwright/test";
 import { recordFinding } from "../findings";
 import type { Finding } from "../types";
+import { headOrGet } from "./net";
 
 /**
  * B2 — broken-link + wrong-destination + DOM-based soft-404 check.
@@ -53,36 +54,6 @@ function classify(href: string, baseOrigin: string): LinkClass {
 		console.debug(`[recce-links] classify(${h}) failed:`, e);
 		return "other";
 	}
-}
-
-async function headOrGet(
-	ctx: APIRequestContext,
-	url: string,
-	cache: Map<string, number>,
-	timeoutMs: number,
-): Promise<number> {
-	const cached = cache.get(url);
-	if (cached !== undefined) return cached;
-	let status = 0;
-	try {
-		const res = await ctx.head(url, { timeout: timeoutMs });
-		status = res.status();
-		if (status === 405 || status === 501) {
-			const r2 = await ctx.get(url, { timeout: timeoutMs });
-			status = r2.status();
-		}
-	} catch (e) {
-		console.debug(`[recce-links] HEAD ${url} threw:`, e);
-		try {
-			const r3 = await ctx.get(url, { timeout: timeoutMs });
-			status = r3.status();
-		} catch (e2) {
-			console.debug(`[recce-links] GET fallback ${url} threw:`, e2);
-			status = 0;
-		}
-	}
-	cache.set(url, status);
-	return status;
 }
 
 type Soft404Context = {
@@ -295,7 +266,13 @@ export async function checkLinks(
 		if (kind === "external") {
 			if (externalHeadCount >= EXTERNAL_HEAD_CAP_PER_PAGE) continue;
 			externalHeadCount += 1;
-			const status = await headOrGet(ctx, absolute, checkedLinks, 5000);
+			const status = await headOrGet(
+				ctx,
+				absolute,
+				absolute,
+				checkedLinks,
+				5000,
+			);
 			if (status === 0) {
 				recordFinding({
 					url,
@@ -321,7 +298,7 @@ export async function checkLinks(
 		}
 
 		// internal
-		const status = await headOrGet(ctx, absolute, checkedLinks, 5000);
+		const status = await headOrGet(ctx, absolute, absolute, checkedLinks, 5000);
 		if (status && status >= 400) {
 			recordFinding({
 				url,

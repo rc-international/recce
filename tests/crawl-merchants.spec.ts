@@ -24,7 +24,17 @@ import type { Finding } from "./utils/types";
  * and reuse B1/B2/B5 via the shared check helpers.
  */
 
-const MERCHANT_RE = /^\/sites\/en\/.+\/.+\/[^/]+$/;
+/**
+ * Merchant URL pattern — requires EXACTLY 6 path segments:
+ *   /sites/en/<country>/<region>/<city>/<category>/<merchant-slug>/<id>
+ * Note: `/sites` + 5 segments below = 6 total non-empty segments.
+ *
+ * Previous pattern `^/sites/en/.+/.+/[^/]+$` was too permissive — it matched
+ * category index pages like `/sites/en/mx/jalisco/coffee_shop` (4 segments)
+ * and skipped the assertion that a merchant was actually reached, allowing
+ * silent "crawled but checked zero merchants" runs.
+ */
+const MERCHANT_RE = /^\/sites\/en(?:\/[^/]+){6}$/;
 
 function isMerchantPath(urlStr: string): boolean {
 	try {
@@ -82,7 +92,9 @@ test.describe("Merchants BFS crawl (B3)", () => {
 		const result = await crawl(page, {
 			baseURL,
 			seedUrls: crawlSeeds,
-			maxPages: mode === "audit" ? 2000 : 50,
+			// Audit defers to the crawler defaults (2000 or MAX_PAGES env override)
+			// so ops can tune via env. Pulse keeps a fixed 50 for the daily budget.
+			maxPages: mode === "audit" ? undefined : 50,
 			project,
 			pageHooks: [
 				// See crawl-articles.spec.ts for rationale — attach listeners once,
@@ -299,6 +311,13 @@ test.describe("Merchants BFS crawl (B3)", () => {
 		expect(
 			result.crawled.length,
 			"crawler produced zero pages — seed list or sitemap broken",
+		).toBeGreaterThan(0);
+		// Silent-fail guard — a crawl that visits pages but finds zero merchants
+		// means MERCHANT_RE, sitemap content, or seed list drifted. Don't let
+		// this scenario masquerade as a passing suite.
+		expect(
+			merchantsChecked,
+			"crawl visited pages but matched zero merchants — MERCHANT_RE or seeds drifted",
 		).toBeGreaterThan(0);
 	});
 });

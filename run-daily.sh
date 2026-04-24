@@ -35,10 +35,12 @@ fi
 echo $$ > "$PID_FILE"
 trap 'rm -f "$PID_FILE"' EXIT
 
-# Node / PATH setup.
+# Node / PATH setup — pick highest semver (not lexicographic, which picks v9
+# before v18). `sort -V` is GNU sort version-sort; available on Ubuntu and
+# Debian-based VPS hosts the crawler runs on.
 if [[ -d /home/gordon/.nvm/versions/node ]]; then
-  # shellcheck disable=SC2012  # ls is fine here — version dirs are semver-safe
-  NODE_VERSION="$(ls /home/gordon/.nvm/versions/node/ 2>/dev/null | tail -1 || true)"
+  # shellcheck disable=SC2012  # ls + sort -V is the portable version-sort path
+  NODE_VERSION="$(ls /home/gordon/.nvm/versions/node/ 2>/dev/null | sort -V | tail -1 || true)"
   if [[ -n "$NODE_VERSION" ]]; then
     export PATH="/home/gordon/.nvm/versions/node/${NODE_VERSION}/bin:$PATH"
   fi

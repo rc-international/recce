@@ -1,6 +1,6 @@
-import { execSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { consolidateFindings, getLatestJsonPath } from "./utils/findings";
+import { safeWilcoNotify } from "./utils/wilco-notify";
 
 /**
  * Playwright global teardown.
@@ -34,17 +34,10 @@ export default async function globalTeardown(): Promise<void> {
 		const msg = `findings-latest.json is missing after teardown (mode=${mode})`;
 		console.error(`[recce-teardown] ${msg}`);
 		process.env.RECCE_TEARDOWN_ESCALATED = "1";
-		try {
-			execSync(
-				`wilco-notify --level error --title "Recce report lost" ${JSON.stringify(msg)}`,
-				{ stdio: "ignore" },
-			);
-		} catch (e) {
-			// wilco-notify is not guaranteed to be on CI. Downgrade to error log.
-			console.error(
-				`[recce-teardown] wilco-notify escalation failed (likely not installed):`,
-				e,
-			);
-		}
+		safeWilcoNotify(msg, {
+			level: "error",
+			title: "Recce report lost",
+			logPrefix: "recce-teardown",
+		});
 	}
 }

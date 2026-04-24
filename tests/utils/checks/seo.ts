@@ -2,6 +2,7 @@ import type { APIRequestContext, Page } from "@playwright/test";
 import { imageSize } from "image-size";
 import { recordFinding } from "../findings";
 import type { Finding } from "../types";
+import { headOrGet } from "./net";
 
 /**
  * C2 — SEO meta-integrity (Phase 5b).
@@ -406,24 +407,17 @@ export async function checkSeo(
 			absoluteImageUrl = ogImageUrl;
 		}
 
-		const cachedStatus = checkedLinks.get(absoluteImageUrl);
-		let status: number;
-		if (cachedStatus !== undefined) {
-			status = cachedStatus;
-		} else {
-			status = 0;
-			try {
-				const res = await ctx.fetch(absoluteImageUrl, {
-					method: "HEAD",
-					timeout: 5000,
-				});
-				status = res.status();
-			} catch (e) {
-				console.debug(`[recce-seo] HEAD ${absoluteImageUrl} threw:`, e);
-				status = 0;
-			}
-			checkedLinks.set(absoluteImageUrl, status);
-		}
+		// Use the shared headOrGet so cache semantics match checkLinks/checkImages:
+		// without this, HEAD-only here would cache 405/403/501 against
+		// `absoluteImageUrl` and downstream checks that re-read the cache would
+		// skip their own fallback, causing spurious broken-link findings.
+		const status = await headOrGet(
+			ctx,
+			absoluteImageUrl,
+			absoluteImageUrl,
+			checkedLinks,
+			5000,
+		);
 		if (!(status >= 200 && status < 300)) {
 			recordFinding({
 				url,
