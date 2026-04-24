@@ -1,4 +1,7 @@
-import { expect, test } from "@playwright/test";
+import { expect, type Page, test } from "@playwright/test";
+import { checkButtons } from "./utils/checks/buttons";
+import { checkImages } from "./utils/checks/images";
+import { checkLinks } from "./utils/checks/links";
 import { crawl } from "./utils/crawler";
 import { recordFinding } from "./utils/findings";
 import type { Finding } from "./utils/types";
@@ -12,8 +15,9 @@ import type { Finding } from "./utils/types";
  *     "at least one image". Failures are pushed through recordFinding()
  *     rather than raised via expect(), so the spec never aborts mid-crawl.
  *
- * Pulse mode caps pages at 25 (overriding the default 50) to keep wall-time
- * well inside the 5-minute budget.
+ * Phase 3 adds B1/B2/B4/B5 via the shared check helpers and a shared
+ * `checkedLinks` cache so HEAD-dedup spans images + links. Pulse mode caps
+ * pages at 25 to stay inside the 5-minute budget.
  */
 
 test.describe("Articles BFS crawl", () => {
@@ -31,13 +35,24 @@ test.describe("Articles BFS crawl", () => {
 		}
 		const project = testInfo.project.name as Finding["project"];
 
+		// Shared caches across B1/B2 for this crawl run.
+		const checkedLinks = new Map<string, number>();
+		const soft404Context = {
+			visited: new Set<string>(),
+			soft404Checked: new Set<string>(),
+		};
+
 		const result = await crawl(page, {
 			baseURL,
 			seedUrls: crawlSeeds,
 			maxPages: 25,
 			project,
 			perPageChecks: [
-				async (p, url) => {
+				async (pl, url) => {
+					const p = pl as Page;
+					soft404Context.visited.add(url);
+
+					// Keep the lightweight phase-2 smoke checks.
 					try {
 						const bodyText = await p.evaluate(() => {
 							return (document.body?.innerText ?? "").trim();
@@ -74,6 +89,32 @@ test.describe("Articles BFS crawl", () => {
 						}
 					} catch (e) {
 						console.debug(`[crawl-articles] img check ${url} failed:`, e);
+					}
+
+					// Phase-3 checks. Each helper has its own try/catch internally,
+					// but wrap one more layer so a single failure can't abort the
+					// crawl.
+					try {
+						await checkImages(p, { url, project, checkedLinks });
+					} catch (e) {
+						console.debug(`[crawl-articles] checkImages ${url} failed:`, e);
+					}
+
+					try {
+						await checkButtons(p, { url, project });
+					} catch (e) {
+						console.debug(`[crawl-articles] checkButtons ${url} failed:`, e);
+					}
+
+					try {
+						await checkLinks(p, {
+							url,
+							project,
+							checkedLinks,
+							soft404Context,
+						});
+					} catch (e) {
+						console.debug(`[crawl-articles] checkLinks ${url} failed:`, e);
 					}
 				},
 			],
