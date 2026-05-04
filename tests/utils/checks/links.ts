@@ -28,6 +28,15 @@ const SOFT_404_RE =
 const EXTERNAL_HEAD_CAP_PER_PAGE = 50;
 const MAILTO_RE = /^mailto:[^@\s]+@[^\s@]+\.[^\s@]+$/i;
 const TEL_RE = /^tel:\+?[\d\s().-]{3,}$/i;
+/**
+ * Cascade threshold: once this many internal HEADs to the same origin have
+ * returned status=0 from one source page, stop emitting per-href findings and
+ * collapse the rest into a single `origin-overloaded` finding. Set from
+ * production data (2026-05-04 valors.io pulse): one slow SSR page emitted 179
+ * unique false-positive `internal-link-unreachable` lines, all caused by
+ * cascading 5s timeouts against the same origin.
+ */
+const INTERNAL_UNREACHABLE_CASCADE_LIMIT = 5;
 
 type LinkClass =
 	| "internal"
@@ -167,6 +176,13 @@ export async function checkLinks(
 
 	let externalHeadCount = 0;
 	const internalForSoft404: string[] = [];
+	// Track per-origin internal HEAD failures so a single overwhelmed origin
+	// (e.g. an SSR page that pegs neighbour pages at 5s timeouts) does not flood
+	// findings with one entry per neighbour href.
+	const internalUnreachableByOrigin = new Map<
+		string,
+		{ count: number; sample: string[]; suppressed: number }
+	>();
 
 	for (const href of uniqueHrefs) {
 		const hl = href.toLowerCase();
@@ -305,15 +321,42 @@ export async function checkLinks(
 			// own URLs. Mirror the external branch's `-unreachable` check name
 			// for consistency, and do NOT feed unreachable URLs into the
 			// soft-404 sweep (no 2xx body to classify).
-			recordFinding({
-				url,
-				check: "internal-link-unreachable",
-				severity: "error",
-				message: `internal link unreachable: ${absolute}`,
-				element: { tag: "a", attr: { href } },
-				actual: "network error",
-				project,
-			});
+			//
+			// Cascade collapse: a single slow-SSR page can fan out to N
+			// neighbour-page HEADs that all hit the 5s timeout, drowning real
+			// signals. Once N=INTERNAL_UNREACHABLE_CASCADE_LIMIT failures have
+			// hit the same origin from this source page, suppress further
+			// per-href findings and emit one rolling `origin-overloaded` finding
+			// at sweep end.
+			let originKey = absolute;
+			try {
+				originKey = new URL(absolute).origin;
+			} catch (e) {
+				console.debug(`[recce-links] origin(${absolute}) failed:`, e);
+			}
+			const bucket = internalUnreachableByOrigin.get(originKey) ?? {
+				count: 0,
+				sample: [],
+				suppressed: 0,
+			};
+			bucket.count += 1;
+			if (bucket.count <= INTERNAL_UNREACHABLE_CASCADE_LIMIT) {
+				if (bucket.sample.length < INTERNAL_UNREACHABLE_CASCADE_LIMIT) {
+					bucket.sample.push(absolute);
+				}
+				recordFinding({
+					url,
+					check: "internal-link-unreachable",
+					severity: "error",
+					message: `internal link unreachable: ${absolute}`,
+					element: { tag: "a", attr: { href } },
+					actual: "network error",
+					project,
+				});
+			} else {
+				bucket.suppressed += 1;
+			}
+			internalUnreachableByOrigin.set(originKey, bucket);
 			continue;
 		}
 		if (status >= 400) {
@@ -335,6 +378,25 @@ export async function checkLinks(
 			!soft404Ctx.soft404Checked.has(absolute)
 		) {
 			internalForSoft404.push(absolute);
+		}
+	}
+
+	// Cascade rollup: if any origin had >LIMIT unreachable internal HEADs, emit
+	// a single overload-summary finding so the per-href noise is bounded.
+	for (const [originKey, b] of internalUnreachableByOrigin) {
+		if (b.suppressed > 0) {
+			recordFinding({
+				url,
+				check: "origin-overloaded",
+				severity: "error",
+				message:
+					`origin ${originKey} returned ${b.count} unreachable internal links from this page; ` +
+					`suppressed ${b.suppressed} additional per-href findings (sample: ${b.sample.slice(0, 3).join(", ")}); ` +
+					`likely SSR/origin overload, not ${b.count} distinct broken links`,
+				expected: "all internal HEADs reachable",
+				actual: `${b.count} HEADs returned 0 (network error/timeout)`,
+				project,
+			});
 		}
 	}
 

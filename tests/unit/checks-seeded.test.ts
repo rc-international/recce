@@ -370,6 +370,55 @@ try {
 		expect(recaptcha).toHaveLength(0);
 	});
 
+	test("internal-link-unreachable cascade collapses to one origin-overloaded finding", () => {
+		// Production scenario (2026-05-04 valors.io pulse, mata-roma):
+		// one slow-SSR page emitted 179 unique false-positive
+		// `internal-link-unreachable` lines, one per neighbour href, all caused
+		// by cascading 5s timeouts against the same origin. The fix: cap the
+		// per-href findings at INTERNAL_UNREACHABLE_CASCADE_LIMIT (5) and emit
+		// a single rolling `origin-overloaded` finding for the rest.
+		//
+		// To trigger this without hitting a real flaky origin, we pre-seed
+		// `checkedLinks` with status=0 for 12 same-origin internal links and
+		// stage a parent page whose anchors all point at them. headOrGet
+		// short-circuits to the cached 0, so the cascade branch fires.
+		const ts = "2026-04-24T10-06-00.000Z";
+		const ORIGIN = "https://cascade.test";
+		const hrefs = Array.from({ length: 12 }, (_, i) => `/p/${i}`);
+		const anchors = hrefs.map((h) => `<a href="${ORIGIN}${h}">x</a>`).join("");
+		const seed = hrefs.map((h) => `["${ORIGIN}${h}", 0]`).join(",");
+		const script = `
+const { chromium } = await import("@playwright/test");
+const { checkLinks } = await import(${JSON.stringify(path.join(REPO_ROOT, "tests/utils/checks/links.ts"))});
+
+const browser = await chromium.launch();
+try {
+  const ctx = await browser.newContext();
+  const page = await ctx.newPage();
+  await page.setContent(${JSON.stringify(`<html><body>${anchors}</body></html>`)}, { waitUntil: "domcontentloaded" });
+  // Seed all 12 same-origin URLs as unreachable so headOrGet short-circuits
+  // to the cached 0 without issuing real HEADs.
+  const checkedLinks = new Map([${seed}]);
+  await checkLinks(page, { url: "${ORIGIN}/parent", project: "chromium", checkedLinks });
+} finally {
+  await browser.close();
+}
+`;
+		const findings = runScenario(script, ts);
+		const unreachable = findings.filter(
+			(f) => f.check === "internal-link-unreachable",
+		);
+		const overloaded = findings.filter((f) => f.check === "origin-overloaded");
+		// 5 per-href findings up to the cascade limit, then collapsed.
+		expect(unreachable).toHaveLength(5);
+		// One rollup with suppression count.
+		expect(overloaded).toHaveLength(1);
+		expect(overloaded[0].severity).toBe("error");
+		expect(overloaded[0].message).toContain(`${ORIGIN}`);
+		// 12 total, 5 emitted, 7 suppressed.
+		expect(overloaded[0].actual).toContain("12 HEADs");
+	});
+
 	test("B5b: reCAPTCHA button is info recaptcha-managed, NOT error", () => {
 		const ts = "2026-04-24T10-05-00.000Z";
 		const script = scenarioPrelude(
