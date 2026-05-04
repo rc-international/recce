@@ -277,6 +277,79 @@ describe("findings: consolidateFindings", () => {
 		expect(existsSync(latest)).toBe(true);
 	});
 
+	test("RUN_TS mismatch: teardown discovers worker-written JSONL by mode prefix", () => {
+		// Reproduces the production bug: workers loaded findings.ts before
+		// globalSetup mutated process.env.RECCE_RUN_TS, so each worker resolved
+		// its own `new Date()` at module init. teardown's RUN_TS therefore
+		// pointed at a non-existent JSONL and Discord reported 0/0/0.
+		//
+		// Simulate: write a JSONL under timestamp WORKER_TS, then call
+		// consolidateFindings with RECCE_RUN_TS=TEARDOWN_TS (different).
+		const WORKER_TS = "2026-04-23T00-00-00.123Z";
+		const TEARDOWN_TS = "2026-04-23T00-00-00.456Z";
+		const findingsDir = path.join(workDir, "test-results", "findings");
+		const workerJsonl = path.join(findingsDir, `pulse-${WORKER_TS}.jsonl`);
+		writeFileSync(
+			workerJsonl,
+			[
+				JSON.stringify({
+					url: "/p1",
+					check: "image-broken",
+					severity: "error",
+					message: "from-worker",
+					project: "chromium",
+				}),
+				JSON.stringify({
+					url: "/p1",
+					check: "link-broken",
+					severity: "warn",
+					message: "from-worker",
+					project: "chromium",
+				}),
+				"",
+			].join("\n"),
+			"utf8",
+		);
+
+		const out = runInChild(
+			`
+			const { consolidateFindings } = require(${JSON.stringify(MODULE_PATH)});
+			const artifact = consolidateFindings({
+				startedAt: "2026-04-23T00:00:00.000Z",
+				finishedAt: "2026-04-23T00:00:10.000Z",
+				mode: "pulse",
+				baseURL: "http://localhost:9999",
+				pagesCrawled: 1,
+				rateLimited: 0,
+			});
+			// Bun routes console.debug to stdout; sandwich the JSON between
+			// markers so the test can isolate it from any debug noise the
+			// discovery branch emits.
+			process.stdout.write("<<<JSON>>>" + JSON.stringify(artifact) + "<<</JSON>>>");
+		`,
+			{ RECCE_RUN_TS: TEARDOWN_TS },
+		);
+		const match = out.match(/<<<JSON>>>([\s\S]*?)<<<\/JSON>>>/);
+		if (!match) throw new Error(`no JSON marker in child output: ${out}`);
+		const artifact = JSON.parse(match[1]);
+		// Should have discovered the worker's JSONL despite mismatched TEARDOWN_TS.
+		expect(artifact.run.findingCounts).toEqual({
+			error: 1,
+			warn: 1,
+			info: 0,
+		});
+		expect(Object.keys(artifact.byUrl)).toEqual(["/p1"]);
+		expect(artifact.byUrl["/p1"]).toHaveLength(2);
+
+		// Consolidated JSON should mirror the discovered JSONL stem (WORKER_TS),
+		// NOT the teardown-process TEARDOWN_TS, so findings-latest.json points
+		// at a real consolidated file.
+		const expectedJson = path.join(findingsDir, `pulse-${WORKER_TS}.json`);
+		expect(existsSync(expectedJson)).toBe(true);
+		const latest = path.join(findingsDir, "findings-latest.json");
+		expect(existsSync(latest)).toBe(true);
+	});
+
 	test("consolidated artefact parses against the zod schema", () => {
 		const out = runInChild(`
 			const { recordFinding, consolidateFindings } = require(${JSON.stringify(MODULE_PATH)});

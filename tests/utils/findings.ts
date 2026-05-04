@@ -4,8 +4,10 @@ import {
 	existsSync,
 	lstatSync,
 	mkdirSync,
+	readdirSync,
 	readFileSync,
 	renameSync,
+	statSync,
 	symlinkSync,
 	unlinkSync,
 	writeFileSync,
@@ -172,13 +174,52 @@ function isLinkSafe(p: string): boolean {
 export function consolidateFindings(run: Partial<Run>): FindingsArtifact {
 	ensureDir();
 
+	// Discover the JSONL written by workers. Module-init JSONL_PATH derives
+	// from process.env.RECCE_RUN_TS, but Playwright spawns globalSetup,
+	// workers, and globalTeardown in separate processes; env mutations made by
+	// globalSetup do not propagate to workers spawned afterwards. Each worker
+	// therefore falls back to its own `new Date()` at module load, writing the
+	// JSONL with a timestamp that lags globalSetup's by a few ms. Result:
+	// teardown's JSONL_PATH points at a non-existent file and Discord reports
+	// 0/0/0 even when the JSONL on disk has hundreds of findings.
+	//
+	// Fix: if module-init JSONL_PATH does not exist on disk, glob for the
+	// newest `<MODE>-*.jsonl` in the findings directory and use that. The
+	// JSON output filename mirrors the discovered JSONL stem so the
+	// findings-latest.json symlink stays consistent with its source.
+	let jsonlPath = JSONL_PATH;
+	let jsonPath = JSON_PATH;
+	if (!existsSync(jsonlPath)) {
+		try {
+			const candidates = readdirSync(FINDINGS_DIR)
+				.filter((n) => n.startsWith(`${MODE}-`) && n.endsWith(".jsonl"))
+				.map((n) => ({
+					n,
+					t: statSync(path.join(FINDINGS_DIR, n)).mtimeMs,
+				}))
+				.sort((a, b) => b.t - a.t);
+			if (candidates.length > 0) {
+				jsonlPath = path.join(FINDINGS_DIR, candidates[0].n);
+				jsonPath = jsonlPath.replace(/\.jsonl$/, ".json");
+				console.debug(
+					`[recce-findings] RUN_TS mismatch: consolidating discovered ${jsonlPath}`,
+				);
+			}
+		} catch (e) {
+			console.debug(
+				`[recce-findings] JSONL discovery in ${FINDINGS_DIR} failed:`,
+				e,
+			);
+		}
+	}
+
 	let raw = "";
 	try {
-		if (existsSync(JSONL_PATH)) {
-			raw = readFileSync(JSONL_PATH, { encoding: "utf8" });
+		if (existsSync(jsonlPath)) {
+			raw = readFileSync(jsonlPath, { encoding: "utf8" });
 		}
 	} catch (e) {
-		console.warn(`[recce-findings] readFile ${JSONL_PATH} failed:`, e);
+		console.warn(`[recce-findings] readFile ${jsonlPath} failed:`, e);
 	}
 
 	const findings = raw ? parseJsonl(raw) : [];
@@ -211,14 +252,14 @@ export function consolidateFindings(run: Partial<Run>): FindingsArtifact {
 		: emptyArtifact(run);
 
 	try {
-		writeFileSync(JSON_PATH, `${JSON.stringify(artifact, null, 2)}\n`, {
+		writeFileSync(jsonPath, `${JSON.stringify(artifact, null, 2)}\n`, {
 			encoding: "utf8",
 		});
 	} catch (e) {
-		console.error(`[recce-findings] writeFile ${JSON_PATH} failed:`, e);
+		console.error(`[recce-findings] writeFile ${jsonPath} failed:`, e);
 		return artifact;
 	}
 
-	swapLatestLink(JSON_PATH);
+	swapLatestLink(jsonPath);
 	return artifact;
 }
