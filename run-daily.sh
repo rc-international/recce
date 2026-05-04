@@ -48,6 +48,12 @@ fi
 
 echo "[$(date -u '+%Y-%m-%d %H:%M:%S UTC')] Starting Recce E2E suite (mode=$RECCE_MODE)"
 
+# Capture suite start so the post-run driver can compute a coherent duration
+# even when Playwright's globalTeardown / discord-reporter onEnd is skipped
+# (e.g. on globalTimeout abort, where Playwright force-stops workers without
+# letting reporters drain).
+export RECCE_START_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
 EXIT_CODE=0
 npx playwright test 2>&1 | tee /tmp/recce-last-run.log || EXIT_CODE=$?
 
@@ -56,5 +62,13 @@ if [[ "$EXIT_CODE" -ne 0 ]]; then
 else
   echo "[$(date -u '+%Y-%m-%d %H:%M:%S UTC')] Recce E2E suite complete — all passed"
 fi
+
+# Post-run safety net — runs UNCONDITIONALLY so a Playwright globalTimeout
+# abort (which skips globalTeardown + reporter onEnd) still produces a
+# Discord post. Idempotent: if teardown already ran, consolidation reproduces
+# the same artifact; the Discord webhook accepts duplicate posts (dedup is
+# the operator's job in that rare case).
+RECCE_RUN_LOG=/tmp/recce-last-run.log npx tsx tests/run-post.ts \
+  || echo "[$(date -u '+%Y-%m-%d %H:%M:%S UTC')] WARN: post-run driver failed (Discord post may be missing)"
 
 exit "$EXIT_CODE"
