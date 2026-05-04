@@ -84,9 +84,16 @@ test.describe("Merchants BFS crawl (B3)", () => {
 
 		// Current-URL ref updated before each per-page check body so the
 		// runtime-error hook (installed once pre-navigation) can tag findings
-		// with the page under test.
-		const urlRef = { value: "" };
+		// with the page under test. Seeded with the first crawl seed so any
+		// pageerror fired during the very first navigation is attributed to
+		// the imminent page rather than the empty string.
+		const urlRef = { value: crawlSeeds[0] ?? "" };
 
+		// Read+increment of merchantsChecked is serialised by the crawler
+		// pinning concurrency to 1 (see tests/utils/crawler.ts,
+		// DEFAULT_CONCURRENCY). If that ever rises, this counter needs an
+		// async-mutex wrapper around the `>= maxMerchants` check + increment
+		// to avoid over-counting.
 		let merchantsChecked = 0;
 
 		const result = await crawl(page, {

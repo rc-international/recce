@@ -299,7 +299,24 @@ export async function checkLinks(
 
 		// internal
 		const status = await headOrGet(ctx, absolute, absolute, checkedLinks, 5000);
-		if (status && status >= 400) {
+		if (status === 0) {
+			// Unreachable (network error, DNS fail, connect timeout). Treat as
+			// error for internal links — the origin should always resolve its
+			// own URLs. Mirror the external branch's `-unreachable` check name
+			// for consistency, and do NOT feed unreachable URLs into the
+			// soft-404 sweep (no 2xx body to classify).
+			recordFinding({
+				url,
+				check: "internal-link-unreachable",
+				severity: "error",
+				message: `internal link unreachable: ${absolute}`,
+				element: { tag: "a", attr: { href } },
+				actual: "network error",
+				project,
+			});
+			continue;
+		}
+		if (status >= 400) {
 			recordFinding({
 				url,
 				check: "broken-link",

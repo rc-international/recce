@@ -52,13 +52,19 @@ echo "[$(date -u '+%Y-%m-%d %H:%M:%S UTC')] Pre-flight origin health: GET ${BASE
 # curl -w '%{http_code}' already writes "000" to stdout on connect/DNS failure,
 # so we do NOT append a fallback "000" in the || branch (that would concatenate
 # to "000000" and break the regex). `|| true` so set -e does not abort.
-STATUS="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "${BASE_URL}/" 2>/dev/null || true)"
+# `-L` follows redirects so a 301/302 from "${BASE_URL}/" to a canonical
+# host (e.g. www. prefix, https upgrade, locale split) does not abort the
+# audit — STATUS captures the final status code after the redirect chain.
+STATUS="$(curl -sSL -o /dev/null -w '%{http_code}' --max-time 10 "${BASE_URL}/" 2>/dev/null || true)"
 STATUS="${STATUS:-000}"
 if [[ ! "$STATUS" =~ ^2[0-9][0-9]$ ]]; then
   MSG="recce audit aborted — origin unreachable: $BASE_URL returned $STATUS"
   echo "$MSG" >&2
   if command -v wilco-notify >/dev/null 2>&1; then
-    wilco-notify --level warning "$MSG" || true
+    # `--` terminates option parsing so a future $MSG containing a leading
+    # `-` cannot be misread as a flag. Aligns with safeWilcoNotify on the JS
+    # side (which passes argv directly so no shell parse happens at all).
+    wilco-notify --level warning -- "$MSG" || true
   fi
   # Exit 0 — a transient origin outage is not a Recce failure.
   exit 0

@@ -1,4 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import {
 	buildDeliveryPlan,
 	classifyDelivery,
@@ -161,10 +164,6 @@ describe("discord-reporter: buildDeliveryPlan", () => {
 // ---------------------------------------------------------------------------
 // Live-fire: mock Discord webhook server + real reporter POST
 // ---------------------------------------------------------------------------
-
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import path from "node:path";
 
 let workDir: string;
 let savedEnv: Record<string, string | undefined> = {};
@@ -453,6 +452,11 @@ describe("discord-reporter: live-fire webhook POST", () => {
 			);
 			expect(fieldNames).toContain("ATTENTION");
 			expect(fieldNames).toContain("Top failing URLs");
+			// The stale "Delivery note: uploaded externally" field added by
+			// buildFindingsEmbed when it still believed the paste host would
+			// succeed must be stripped on fallback — otherwise operators see
+			// two contradictory status lines (upload-ok + upload-failed).
+			expect(fieldNames).not.toContain("Delivery note");
 			const topField = findingsEmbed.fields.find(
 				(f: { name: string }) => f.name === "Top failing URLs",
 			);

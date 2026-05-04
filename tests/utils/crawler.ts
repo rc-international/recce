@@ -76,9 +76,18 @@ const MAX_PAGES_ENV_OVERRIDE: number | null = (() => {
 	const n = Number(raw);
 	return Number.isFinite(n) && n > 0 ? Math.floor(n) : null;
 })();
+/**
+ * Concurrency is pinned to 1 because the crawler reuses a single Playwright
+ * `Page` instance across all navigations. `Page.goto` + subsequent
+ * `page.evaluate` are not re-entrant on the same Page; two workers racing
+ * would interleave "go A, evaluate for B" scenarios. A future version may
+ * lift this by allocating one Page per worker (BrowserContext.newPage) —
+ * until then, pinning to 1 is the correct fix. The env knob is retained as
+ * a safety cap so an operator cannot accidentally bump it beyond 1.
+ */
 const DEFAULT_CONCURRENCY = Math.max(
 	1,
-	Math.min(2, Number(process.env.CRAWL_CONCURRENCY ?? "2")),
+	Math.min(1, Number(process.env.CRAWL_CONCURRENCY ?? "1")),
 );
 const MIN_GOTO_INTERVAL_MS = 750;
 const MAX_RATE_LIMITED = Number(process.env.RECCE_MAX_RATE_LIMITED ?? "10");
@@ -275,7 +284,16 @@ async function fetchSitemapUrl(
 		emitSitemapFailure(url, `sitemap HTTP ${resp.status}`, project);
 		return [];
 	}
-	if (!/xml/i.test(resp.contentType)) {
+	// Accept XML content-types AND gzip content-types for .gz URLs (some CDNs
+	// serve sitemap.xml.gz as application/gzip, application/x-gzip, or the
+	// generic application/octet-stream rather than application/xml). Also
+	// tolerate empty content-type on .gz URLs — rare but seen in the wild.
+	const ct = resp.contentType || "";
+	const isXml = /xml/i.test(ct);
+	const isGzUrl = url.endsWith(".gz");
+	const isGzCt =
+		isGzUrl && (/(^|\b)(gzip|x-gzip|octet-stream)\b/i.test(ct) || ct === "");
+	if (!isXml && !isGzCt) {
 		emitSitemapFailure(
 			url,
 			`sitemap content-type not XML: ${resp.contentType || "(empty)"}`,
@@ -479,20 +497,21 @@ export async function crawl(
 	const sem = createSemaphore(DEFAULT_CONCURRENCY);
 
 	let lastGotoAt = 0;
-	const gotoLock: { locked: boolean } = { locked: false };
+	// Promise-chain lock instead of busy-wait. Each caller chains onto the
+	// previous, so the next contender awaits a settled promise rather than
+	// polling `gotoLock.locked` every 10ms. At concurrency=1 there is never
+	// contention, but the chain keeps the code correct if a future change
+	// raises concurrency (and avoids CPU wakeups in the meantime).
+	let gotoChain: Promise<void> = Promise.resolve();
 
-	const enforcePoliteness = async (): Promise<void> => {
-		// Serialise the "read lastGotoAt, sleep, update" sequence so two workers
-		// don't both decide they can go simultaneously.
-		while (gotoLock.locked) await sleep(10);
-		gotoLock.locked = true;
-		try {
+	const enforcePoliteness = (): Promise<void> => {
+		const next = gotoChain.then(async () => {
 			const delta = MIN_GOTO_INTERVAL_MS - (Date.now() - lastGotoAt);
 			if (delta > 0) await sleep(delta);
 			lastGotoAt = Date.now();
-		} finally {
-			gotoLock.locked = false;
-		}
+		});
+		gotoChain = next.catch(() => {});
+		return next;
 	};
 
 	let aborted = false;
@@ -519,14 +538,68 @@ export async function crawl(
 		let status: number | null = null;
 		let retryAfterMs: number | null = null;
 		try {
-			const resp = await page.goto(task.url, { waitUntil: "networkidle" });
+			// `networkidle` is fragile on SPA/analytics-heavy pages — they keep
+			// a trickle of requests open past the point of meaningful render.
+			// Use `domcontentloaded` for the hard gate, then best-effort
+			// `networkidle` with a short cap for the settle signal. A timeout
+			// on the soft-wait is NOT an error — we proceed to checks either
+			// way.
+			const resp = await page.goto(task.url, {
+				waitUntil: "domcontentloaded",
+				timeout: 15000,
+			});
+			try {
+				// Playwright's Page type has waitForLoadState; PageLike doesn't
+				// strictly, so guard for the unit-test stub case.
+				const waitFn = (
+					page as unknown as {
+						waitForLoadState?: (
+							s: string,
+							o: { timeout: number },
+						) => Promise<void>;
+					}
+				).waitForLoadState;
+				if (typeof waitFn === "function") {
+					await waitFn
+						.call(page, "networkidle", { timeout: 5000 })
+						.catch((e: unknown) => {
+							console.debug(
+								`[recce-crawler] networkidle wait ${task.url} timed out:`,
+								e,
+							);
+						});
+				}
+			} catch (e) {
+				console.debug(
+					`[recce-crawler] waitForLoadState ${task.url} failed:`,
+					e,
+				);
+			}
 			status = resp?.status() ?? null;
 			if (status === 429 || status === 503) {
 				const raw = resp?.headers()?.["retry-after"];
 				retryAfterMs = parseRetryAfter(raw ?? null);
 			}
 		} catch (e) {
+			const msg = (e as Error)?.message ?? String(e);
 			console.debug(`[recce-crawler] goto ${task.url} threw:`, e);
+			// Emit a formal finding so navigation failures surface in the
+			// findings artifact rather than being silently swallowed.
+			try {
+				recordFinding({
+					url: task.url,
+					check: "crawl-goto-failed",
+					severity: "warn",
+					message: `page.goto threw: ${msg.slice(0, 200)}`,
+					actual: msg.slice(0, 200),
+					project,
+				});
+			} catch (inner) {
+				console.warn(
+					`[recce-crawler] recordFinding crawl-goto-failed failed:`,
+					inner,
+				);
+			}
 			return;
 		}
 

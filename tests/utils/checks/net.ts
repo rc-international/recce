@@ -36,19 +36,27 @@ export async function headOrGet(
 ): Promise<number> {
 	const cached = cache.get(cacheKey);
 	if (cached !== undefined) return cached;
+
+	// Split HEAD and GET error paths so:
+	//   - a HEAD that succeeds with 403/405/501 followed by a throwing GET
+	//     logs "GET fallback threw" (not "HEAD threw")
+	//   - we never issue two GETs for a flaky URL (the previous nested
+	//     try/catch issued one GET on HEAD-fallback and a second GET in the
+	//     outer catch when the first GET threw)
 	let status = 0;
+	let needGetFallback = false;
 	try {
 		const res = await ctx.head(fetchUrl, { timeout: timeoutMs });
 		status = res.status();
-		if (GET_FALLBACK_STATUSES.has(status)) {
-			const r2 = await ctx.get(fetchUrl, { timeout: timeoutMs });
-			status = r2.status();
-		}
+		if (GET_FALLBACK_STATUSES.has(status)) needGetFallback = true;
 	} catch (e) {
 		console.debug(`[recce-net] HEAD ${fetchUrl} threw:`, e);
+		needGetFallback = true;
+	}
+	if (needGetFallback) {
 		try {
-			const r3 = await ctx.get(fetchUrl, { timeout: timeoutMs });
-			status = r3.status();
+			const r = await ctx.get(fetchUrl, { timeout: timeoutMs });
+			status = r.status();
 		} catch (e2) {
 			console.debug(`[recce-net] GET fallback ${fetchUrl} threw:`, e2);
 			status = 0;

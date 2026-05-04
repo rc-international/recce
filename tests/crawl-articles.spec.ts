@@ -56,7 +56,12 @@ test.describe("Articles BFS crawl", () => {
 		// runs. The runtime-error hook attaches listeners once (via pageHooks,
 		// BEFORE the first goto) and reads urlRef.value inside every event
 		// callback so findings are tagged with the page under test.
-		const urlRef = { value: "" };
+		//
+		// Seed with the first crawl seed so pageerror/console events fired
+		// during the very first navigation (before perPageChecks runs and
+		// updates urlRef) are attributed to the imminent page URL instead of
+		// the empty string.
+		const urlRef = { value: crawlSeeds[0] ?? "" };
 
 		const result = await crawl(page, {
 			baseURL,

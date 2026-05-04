@@ -143,6 +143,10 @@ export async function uploadToPasteHost(
 		"curl",
 		[
 			"-sS",
+			// --fail: exit non-zero on HTTP 4xx/5xx so we actually log the
+			// error response body via result.stderr instead of letting a 500
+			// or 413 (file too large) be mis-logged as "non-URL response".
+			"--fail",
 			"--max-time",
 			String(Math.ceil(EXTERNAL_UPLOAD_TIMEOUT_MS / 1000)),
 			"-F",
@@ -245,6 +249,15 @@ export async function deliverReport(
 			console.warn(
 				`[recce-discord] external upload failed; falling back to truncated inline`,
 			);
+			// Strip the now-stale "Delivery note: uploaded externally" field
+			// added by buildFindingsEmbed when it still thought we'd succeed
+			// with the paste host — leaving it in place plus the ATTENTION
+			// banner gives operators two contradictory status lines.
+			if (findingsEmbed.fields) {
+				findingsEmbed.fields = findingsEmbed.fields.filter(
+					(f) => f.name !== "Delivery note",
+				);
+			}
 			findingsEmbed.fields = appendField(findingsEmbed.fields, {
 				name: "ATTENTION",
 				value:
@@ -279,9 +292,11 @@ export async function deliverReport(
 			const form = new FormData();
 			form.append("payload_json", JSON.stringify(payloadJson));
 			const buf = readFileSync(plan.attachmentPath);
-			const blob = new Blob([new Uint8Array(buf)], {
-				type: "application/json",
-			});
+			// `readFileSync` returns a Node Buffer, which is a Uint8Array
+			// subclass — Blob accepts it directly. Previously we wrapped it in
+			// `new Uint8Array(buf)`, which copies the bytes before Blob makes
+			// its own copy. Negligible at 7.5 MB but no reason to pay twice.
+			const blob = new Blob([buf], { type: "application/json" });
 			form.append("files[0]", blob, path.basename(plan.attachmentPath));
 			resp = await fetch(webhookUrl, { method: "POST", body: form });
 		} else {

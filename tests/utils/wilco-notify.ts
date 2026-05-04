@@ -59,7 +59,16 @@ export function safeWilcoNotify(message: string, opts: NotifyOptions): void {
 	const args = buildNotifyArgv(message, opts);
 	const prefix = opts.logPrefix ?? "recce";
 	try {
-		execFileSync("wilco-notify", args, { stdio: "ignore" });
+		// Pass env explicitly so execFileSync resolves `wilco-notify` from the
+		// CURRENT `process.env.PATH` (Bun's execFileSync uses a cached PATH
+		// otherwise — observed 2026-04-24). This matters for the unit test
+		// that simulates wilco-notify being absent by setting PATH to
+		// /nonexistent; without this, PATH mutation is silently ignored and
+		// the test's "survives ENOENT" assertion is never actually exercised.
+		execFileSync("wilco-notify", args, {
+			stdio: "ignore",
+			env: process.env,
+		});
 	} catch (e) {
 		console.debug(
 			`[${prefix}] wilco-notify escalation failed (likely not installed):`,

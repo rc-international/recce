@@ -284,6 +284,13 @@ try {
   // setContent with an absolute href so Playwright's URL harvest picks it up.
   await page.setContent('<html><body><a href="' + soft404 + '">dead link</a></body></html>', { waitUntil: "domcontentloaded" });
   const checkedLinks = new Map();
+  // Pre-seed the headOrGet cache: Playwright route() mocks installed by
+  // installSeededBugs intercept page-level requests but NOT the standalone
+  // APIRequestContext used by headOrGet, so ctx.head(soft404) would return 0
+  // and short-circuit into the new internal-link-unreachable branch, skipping
+  // the soft-404 DOM sweep. Seeding the cache with a 200 mirrors a real origin
+  // where HEAD succeeds and the soft-404 only manifests after page.goto.
+  checkedLinks.set(soft404, 200);
   await checkLinks(page, { url: ${JSON.stringify(FIXTURE_BASE)} + "/parent", project: "chromium", checkedLinks });
 } finally {
   await browser.close();

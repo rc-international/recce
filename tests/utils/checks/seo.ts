@@ -177,7 +177,10 @@ function titleBounds(lang: string | null): {
 } {
 	// strict=true means out-of-range emits a warning; strict=false means we
 	// only warn when ABOVE the max (no min).
-	const english = typeof lang === "string" && /^en/i.test(lang);
+	// Match BCP-47 English ("en", "en-US", "en_GB") but NOT strings that merely
+	// start with "en" like "entity" or "english". Accept separator `-` or `_`,
+	// or end-of-string.
+	const english = typeof lang === "string" && /^en(?:$|[-_])/i.test(lang);
 	if (english) {
 		const min = Number(process.env.RECCE_TITLE_MIN_LEN ?? "30");
 		const max = Number(process.env.RECCE_TITLE_MAX_LEN ?? "65");
@@ -197,9 +200,62 @@ function titleBounds(lang: string | null): {
 	};
 }
 
+/**
+ * Fetch just enough bytes of an og:image to measure its dimensions.
+ *
+ * Sends `Range: bytes=0-131071` so the server can stream only the header +
+ * dimension markers (JPEG SOF, PNG IHDR, WebP VP8X, etc. all within the
+ * first ~128 KB in practice). If the server ignores the Range header we
+ * still get correct dims — `image-size` only needs the header bytes. Returns
+ * null on any failure so the caller can skip the finding.
+ */
+async function fetchOgImageDims(
+	ctx: APIRequestContext,
+	absoluteImageUrl: string,
+): Promise<{ w: number; h: number } | null> {
+	try {
+		const res = await ctx.fetch(absoluteImageUrl, {
+			timeout: 8000,
+			headers: { Range: "bytes=0-131071" },
+		});
+		// 206 Partial Content OR 200 OK (server ignored Range) are both fine.
+		if (!res.ok() && res.status() !== 206) return null;
+		const buf = await res.body();
+		const dims = imageSize(new Uint8Array(buf));
+		const w = dims.width ?? 0;
+		const h = dims.height ?? 0;
+		if (w === 0 || h === 0) return null;
+		return { w, h };
+	} catch (e) {
+		console.debug(
+			`[recce-seo] og:image dim fetch ${absoluteImageUrl} failed:`,
+			e,
+		);
+		return null;
+	}
+}
+
 // -----------------------------------------------------------------------------
 // Main check
 // -----------------------------------------------------------------------------
+
+/**
+ * Per-run cache of measured og:image dimensions, keyed by absolute URL.
+ * Without this, a run that visits N pages which all reference the same
+ * shared og:image (very common — the site header/default social image) does
+ * N full-body GETs to measure dims. The HEAD/GET status cache in
+ * `checkedLinks` already dedupes the reachability probe; this second cache
+ * dedupes the second (dims) request.
+ *
+ * Module-level so it survives across checkSeo calls within the same process.
+ * Reset by tests via `__resetSeoDimCache()`.
+ */
+const ogImageDimCache = new Map<string, { w: number; h: number } | null>();
+
+/** Test-only reset. Exposed for unit tests that want a clean cache. */
+export function __resetSeoDimCache(): void {
+	ogImageDimCache.clear();
+}
 
 export async function checkSeo(
 	page: Page,
@@ -429,39 +485,25 @@ export async function checkSeo(
 				project,
 			});
 		} else {
-			// Fetch the body and measure dims. This is a second request (GET)
-			// because HEAD does not return image bytes; the HEAD result stays
-			// cached so repeat callers skip BOTH HEAD and GET on this URL only
-			// when dims are already known (we track the GET-for-dims result
-			// separately to keep cache semantics compatible with checkImages).
-			try {
-				const res = await ctx.fetch(absoluteImageUrl, { timeout: 8000 });
-				if (res.ok()) {
-					try {
-						const buf = await res.body();
-						const dims = imageSize(new Uint8Array(buf));
-						const w = dims.width ?? 0;
-						const h = dims.height ?? 0;
-						if (w < 1200 || h < 630) {
-							recordFinding({
-								url,
-								check: "seo-og-image-small",
-								severity: "warn",
-								message: `og:image ${w}x${h} (< 1200x630)`,
-								expected: ">= 1200x630",
-								actual: `${w}x${h}`,
-								project,
-							});
-						}
-					} catch (e) {
-						console.debug(
-							`[recce-seo] image-size parse ${absoluteImageUrl} failed:`,
-							e,
-						);
-					}
-				}
-			} catch (e) {
-				console.debug(`[recce-seo] GET ${absoluteImageUrl} threw:`, e);
+			// Dims are the expensive part — a full-body GET. Dedupe across
+			// pages: the same og:image URL appears on hundreds of pages in
+			// practice (shared social-share asset). First hit fetches, all
+			// subsequent hits reuse the measured dims.
+			let dims = ogImageDimCache.get(absoluteImageUrl);
+			if (dims === undefined) {
+				dims = await fetchOgImageDims(ctx, absoluteImageUrl);
+				ogImageDimCache.set(absoluteImageUrl, dims);
+			}
+			if (dims && (dims.w < 1200 || dims.h < 630)) {
+				recordFinding({
+					url,
+					check: "seo-og-image-small",
+					severity: "warn",
+					message: `og:image ${dims.w}x${dims.h} (< 1200x630)`,
+					expected: ">= 1200x630",
+					actual: `${dims.w}x${dims.h}`,
+					project,
+				});
 			}
 		}
 	}
