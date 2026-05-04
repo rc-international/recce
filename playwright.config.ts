@@ -18,6 +18,24 @@ export default defineConfig({
 	forbidOnly: !!process.env.CI,
 	retries: process.env.CI ? 2 : 0,
 	workers: 1,
+	// Safety net — bound the entire suite. If any single spec or worker stalls
+	// (e.g. SSR cold-start cascading into stuck networkidle waits, accumulated
+	// listener leaks, or Playwright's between-spec lifecycle wedging), the
+	// runner force-stops, runs globalTeardown, and the Discord reporter's
+	// onEnd still fires. Without this, a hung worker keeps the parent node
+	// process alive indefinitely (observed 2026-05-04: pulse hung at ~13min
+	// with chromium renderer in futex_wait, no sockets, test runner CPU-hot).
+	// pulse mode normally finishes in 5–7 min; audit needs a wider envelope.
+	globalTimeout:
+		(process.env.RECCE_MODE as "pulse" | "audit") === "audit"
+			? 60 * 60 * 1000
+			: 15 * 60 * 1000,
+	// Per-test cap. Default Playwright test timeout is 30s, but the BFS specs
+	// (seo-meta, crawl-articles, crawl-merchants) drive crawl() which hits
+	// 10–15 pages × ~20s each. Bump to 5min so the legitimate work finishes,
+	// while still bounding individual stalls so globalTimeout doesn't have to
+	// be the only safety net.
+	timeout: 5 * 60 * 1000,
 	reporter: [
 		["html"],
 		...(process.env.RECCE_DISCORD_WEBHOOK
