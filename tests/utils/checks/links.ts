@@ -26,6 +26,29 @@ const LEAKED_HOSTS =
 const SOFT_404_RE =
 	/not found|404|error|p[aá]gina no encontrada|p[aá]gina n[aã]o encontrada/i;
 const EXTERNAL_HEAD_CAP_PER_PAGE = 50;
+/**
+ * Cap on internal HEAD probes per page. Article pages can list 100+ internal
+ * links; firing all those HEADs back-to-back at the same origin (on top of
+ * the page's own RSC prefetches and image loads) is what triggers the
+ * Vercel/CDN per-IP rate-limit cascades observed pre-2026-05-05. 30 keeps
+ * a representative sample of in-page links without overwhelming upstream.
+ */
+const INTERNAL_HEAD_CAP_PER_PAGE = Number(
+	process.env.RECCE_INTERNAL_HEAD_CAP ?? "30",
+);
+/**
+ * Sleep between successive HEAD requests within one page check. With
+ * concurrency=1 in the crawler this naturally rate-limits in-page link
+ * probing to ~3 req/s, well below CDN per-IP limits.
+ */
+const INTERNAL_HEAD_DELAY_MS = Number(
+	process.env.RECCE_INTERNAL_HEAD_DELAY_MS ?? "300",
+);
+
+function sleep(ms: number): Promise<void> {
+	if (ms <= 0) return Promise.resolve();
+	return new Promise((r) => setTimeout(r, ms));
+}
 const MAILTO_RE = /^mailto:[^@\s]+@[^\s@]+\.[^\s@]+$/i;
 const TEL_RE = /^tel:\+?[\d\s().-]{3,}$/i;
 /**
@@ -175,6 +198,7 @@ export async function checkLinks(
 	})();
 
 	let externalHeadCount = 0;
+	let internalHeadCount = 0;
 	const internalForSoft404: string[] = [];
 	// Track per-origin internal HEAD failures so a single overwhelmed origin
 	// (e.g. an SSR page that pegs neighbour pages at 5s timeouts) does not flood
@@ -282,6 +306,12 @@ export async function checkLinks(
 		if (kind === "external") {
 			if (externalHeadCount >= EXTERNAL_HEAD_CAP_PER_PAGE) continue;
 			externalHeadCount += 1;
+			// Only pace when we'll actually issue a network HEAD; cache hits
+			// short-circuit. Sleeping on cache hits would multiply the
+			// delay by every page that referenced the same URL.
+			if (!checkedLinks.has(absolute)) {
+				await sleep(INTERNAL_HEAD_DELAY_MS);
+			}
 			const status = await headOrGet(
 				ctx,
 				absolute,
@@ -314,6 +344,12 @@ export async function checkLinks(
 		}
 
 		// internal
+		if (internalHeadCount >= INTERNAL_HEAD_CAP_PER_PAGE) continue;
+		internalHeadCount += 1;
+		// Skip the delay on cache hits — see external branch above.
+		if (!checkedLinks.has(absolute)) {
+			await sleep(INTERNAL_HEAD_DELAY_MS);
+		}
 		const status = await headOrGet(ctx, absolute, absolute, checkedLinks, 5000);
 		if (status === 0) {
 			// Unreachable (network error, DNS fail, connect timeout). Treat as

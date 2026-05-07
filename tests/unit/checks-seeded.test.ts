@@ -304,12 +304,12 @@ try {
 
 	test("B3: missing-hero on merchant fixture produces exactly one hero-missing finding", () => {
 		const ts = "2026-04-24T10-02-00.000Z";
-		// Minimal merchant-check inline: we don't need to route via crawler
-		// for a unit test — just assert the hero rule.
+		// Drives the production helper (checkMerchantHero) so a regression in
+		// the shipped rule fails this test.
 		const script = `
 const { chromium } = await import("@playwright/test");
 const { installSeededBugs, fixtureUrl } = await import(${JSON.stringify(path.join(REPO_ROOT, "tests/fixtures/seeded-bugs.ts"))});
-const { recordFinding } = await import(${JSON.stringify(path.join(REPO_ROOT, "tests/utils/findings.ts"))});
+const { checkMerchantHero } = await import(${JSON.stringify(path.join(REPO_ROOT, "tests/utils/checks/merchant-hero.ts"))});
 
 const browser = await chromium.launch();
 try {
@@ -318,19 +318,11 @@ try {
   await installSeededBugs(page);
   const target = fixtureUrl(${JSON.stringify(FIXTURE_BASE)}, "missing-hero");
   await page.goto(target, { waitUntil: "domcontentloaded" });
-  const heroPresent = await page.evaluate(() => !!document.querySelector("img.object-cover"));
-  if (!heroPresent) {
-    recordFinding({
-      url: target,
-      check: "hero-missing",
-      severity: "error",
-      message: "merchant page has no img.object-cover",
-      element: { tag: "img", selector: "img.object-cover" },
-      expected: "img.object-cover present",
-      actual: "(not found)",
-      project: "chromium",
-    });
-  }
+  await checkMerchantHero(page, {
+    url: target,
+    project: "chromium",
+    slug: "missing-hero",
+  });
 } finally {
   await browser.close();
 }

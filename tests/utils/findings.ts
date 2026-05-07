@@ -222,7 +222,51 @@ export function consolidateFindings(run: Partial<Run>): FindingsArtifact {
 		console.warn(`[recce-findings] readFile ${jsonlPath} failed:`, e);
 	}
 
-	const findings = raw ? parseJsonl(raw) : [];
+	const rawFindings = raw ? parseJsonl(raw) : [];
+
+	// Rate-limit suppression: any URL whose findings include a 429 signal
+	// means the page itself was rate-limited. Every other finding for that URL
+	// is downstream noise (resource HEADs that 429'd, missing meta because the
+	// rate-limit page lacks them, soft-404 because the body is short, etc).
+	// Drop those per-resource findings and emit a single `page-rate-limited`
+	// rollup per affected page so the report focuses on real signal.
+	const isRateLimitFinding = (f: Finding): boolean => {
+		if (f.actual && /(?:^|\W)429\b/.test(String(f.actual))) return true;
+		if (f.message && /\b429\b/.test(f.message)) return true;
+		if (f.check === "rate-limited" || f.check === "page-rate-limited")
+			return true;
+		return false;
+	};
+	const rateLimitedUrls = new Set<string>();
+	const projectByUrl = new Map<string, Finding["project"]>();
+	for (const f of rawFindings) {
+		if (!projectByUrl.has(f.url)) projectByUrl.set(f.url, f.project);
+		if (isRateLimitFinding(f)) rateLimitedUrls.add(f.url);
+	}
+
+	const findings: Finding[] = [];
+	const suppressedByUrl = new Map<string, number>();
+	for (const f of rawFindings) {
+		if (rateLimitedUrls.has(f.url)) {
+			suppressedByUrl.set(f.url, (suppressedByUrl.get(f.url) ?? 0) + 1);
+			continue;
+		}
+		findings.push(f);
+	}
+	for (const url of rateLimitedUrls) {
+		const suppressed = suppressedByUrl.get(url) ?? 0;
+		findings.push({
+			url,
+			check: "page-rate-limited",
+			severity: "warn",
+			message:
+				`page returned HTTP 429 (rate-limited) — suppressed ${suppressed} ` +
+				`downstream findings on this URL as likely rate-limit noise`,
+			expected: "HTTP 2xx",
+			actual: "HTTP 429",
+			project: projectByUrl.get(url) ?? "chromium",
+		});
+	}
 
 	const byUrl: Record<string, Finding[]> = {};
 	const byCheck: Record<string, Finding[]> = {};

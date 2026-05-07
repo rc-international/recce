@@ -3,6 +3,7 @@ import { checkButtons } from "./utils/checks/buttons";
 import { checkContentQuality } from "./utils/checks/content";
 import { checkImages } from "./utils/checks/images";
 import { checkLinks } from "./utils/checks/links";
+import { checkMerchantHero } from "./utils/checks/merchant-hero";
 import { createRuntimeErrorHook } from "./utils/checks/runtime-errors";
 import { checkSecurity } from "./utils/checks/security";
 import { recordSelectorHit } from "./utils/checks/selector-health";
@@ -142,90 +143,15 @@ test.describe("Merchants BFS crawl (B3)", () => {
 						);
 					}
 
-					// Hero existence + size.
+					// Hero existence + size + alt — production rule lives in
+					// tests/utils/checks/merchant-hero.ts so the unit test can
+					// exercise the same code path.
 					try {
-						const hero = await p.evaluate(() => {
-							const el = document.querySelector(
-								"img.object-cover",
-							) as HTMLImageElement | null;
-							if (!el) return null;
-							const rect = el.getBoundingClientRect();
-							return {
-								naturalWidth: el.naturalWidth || 0,
-								naturalHeight: el.naturalHeight || 0,
-								visible:
-									rect.width > 0 &&
-									rect.height > 0 &&
-									window.getComputedStyle(el).visibility !== "hidden" &&
-									window.getComputedStyle(el).display !== "none",
-								alt: el.getAttribute("alt") || "",
-								src: el.getAttribute("src") || "",
-							};
+						await checkMerchantHero(p, {
+							url,
+							project,
+							slug: slugFromUrl(url),
 						});
-						if (!hero) {
-							recordFinding({
-								url,
-								check: "hero-missing",
-								severity: "error",
-								message: `merchant page has no img.object-cover`,
-								element: { tag: "img", selector: "img.object-cover" },
-								expected: "img.object-cover present",
-								actual: "(not found)",
-								project,
-							});
-						} else {
-							if (!hero.visible) {
-								recordFinding({
-									url,
-									check: "hero-not-visible",
-									severity: "error",
-									message: `hero img.object-cover not visible`,
-									element: {
-										tag: "img",
-										selector: "img.object-cover",
-										attr: { src: hero.src },
-									},
-									expected: "visible",
-									actual: "hidden",
-									project,
-								});
-							}
-							if (hero.naturalWidth < 400) {
-								recordFinding({
-									url,
-									check: "hero-too-small",
-									severity: "error",
-									message: `hero naturalWidth=${hero.naturalWidth} (<400)`,
-									element: {
-										tag: "img",
-										selector: "img.object-cover",
-										attr: { src: hero.src },
-									},
-									expected: ">= 400",
-									actual: String(hero.naturalWidth),
-									project,
-								});
-							}
-							const slug = slugFromUrl(url);
-							if (
-								hero.alt &&
-								slug &&
-								hero.alt.toLowerCase() === slug.toLowerCase()
-							) {
-								recordFinding({
-									url,
-									check: "hero-alt-matches-slug",
-									severity: "warn",
-									message: `hero alt matches url slug "${slug}"`,
-									element: {
-										tag: "img",
-										selector: "img.object-cover",
-										attr: { alt: hero.alt },
-									},
-									project,
-								});
-							}
-						}
 					} catch (e) {
 						console.debug(`[crawl-merchants] hero check ${url} failed:`, e);
 					}

@@ -25,17 +25,24 @@ export default defineConfig({
 	// onEnd still fires. Without this, a hung worker keeps the parent node
 	// process alive indefinitely (observed 2026-05-04: pulse hung at ~13min
 	// with chromium renderer in futex_wait, no sockets, test runner CPU-hot).
-	// pulse mode normally finishes in 5–7 min; audit needs a wider envelope.
+	// pulse mode now crawls politely (3s between pages, 300ms between in-page
+	// HEADs, daily-rotated seed sample) to avoid Vercel/CDN per-IP rate-limit
+	// cascades. Pulse run length was ~5–7 min on the old aggressive crawler;
+	// the polite cadence pushes that to ~30–60 min, so allow 90min envelope.
+	// Daily cron has no urgency — the report only needs to land once per day.
 	globalTimeout:
 		(process.env.RECCE_MODE as "pulse" | "audit") === "audit"
-			? 60 * 60 * 1000
-			: 15 * 60 * 1000,
+			? 2 * 60 * 60 * 1000
+			: 90 * 60 * 1000,
 	// Per-test cap. Default Playwright test timeout is 30s, but the BFS specs
-	// (seo-meta, crawl-articles, crawl-merchants) drive crawl() which hits
-	// 10–15 pages × ~20s each. Bump to 5min so the legitimate work finishes,
-	// while still bounding individual stalls so globalTimeout doesn't have to
-	// be the only safety net.
-	timeout: 5 * 60 * 1000,
+	// (seo-meta, crawl-articles, crawl-merchants) drive crawl() which under
+	// the polite cadence hits 100 pages × ~6s each ≈ 10min just for goto
+	// pacing, plus checks. Pulse needs 80min so a single spec can finish the
+	// 100-page sample without tripping per-test timeout. Audit gets the same
+	// envelope; globalTimeout (90min pulse, 2h audit) is the outer wall.
+	// (Observed 2026-05-06: prior 5min cap fired after ~50 pages, leaving
+	// the runner wedged for 82min until globalTimeout cleaned up.)
+	timeout: 80 * 60 * 1000,
 	reporter: [
 		["html"],
 		...(process.env.RECCE_DISCORD_WEBHOOK

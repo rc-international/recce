@@ -393,20 +393,36 @@ export async function checkSeo(
 		});
 	} else {
 		const href = snap.canonical.trim();
-		const absolute = href.startsWith("http://") || href.startsWith("https://");
+		// Validate by parsing, not prefix-matching: `startsWith("http")` lets
+		// malformed values like "http:invalid" or "https:/oops.com" through,
+		// and a parse failure should surface as a finding rather than a
+		// silent console.debug.
+		let parsed: URL | null = null;
+		try {
+			parsed = new URL(href);
+		} catch {
+			parsed = null;
+		}
+		const absolute =
+			parsed != null &&
+			(parsed.protocol === "http:" || parsed.protocol === "https:");
 		if (!absolute) {
 			recordFinding({
 				url,
-				check: "seo-canonical-relative",
+				check: "seo-canonical-invalid",
 				severity: "warn",
-				message: `canonical is relative: "${href}"`,
+				message: `canonical is not a valid absolute http(s):// URL: "${href}"`,
 				expected: "absolute http(s):// URL",
 				actual: href || "(empty)",
 				project,
 			});
 		} else {
+			// `absolute` is true ⇒ `parsed` was constructed; type narrowing
+			// across the boolean intermediate doesn't survive into this
+			// branch, so re-assert.
+			const validParsed = parsed as URL;
 			try {
-				canonicalNormalised = normaliseTrailingSlash(href);
+				canonicalNormalised = normaliseTrailingSlash(validParsed.href);
 			} catch (e) {
 				console.debug(`[recce-seo] canonical parse ${href} failed:`, e);
 			}
@@ -494,7 +510,21 @@ export async function checkSeo(
 				dims = await fetchOgImageDims(ctx, absoluteImageUrl);
 				ogImageDimCache.set(absoluteImageUrl, dims);
 			}
-			if (dims && (dims.w < 1200 || dims.h < 630)) {
+			if (dims == null) {
+				// 2xx response but the body did not parse as an image: HTML
+				// fallback page, corrupt asset, or unsupported format. Don't
+				// silently pass — flag as a separate check so the report
+				// surfaces unusable og:image payloads.
+				recordFinding({
+					url,
+					check: "seo-og-image-unparseable",
+					severity: "error",
+					message: `og:image returned 2xx but dimensions could not be read`,
+					expected: "parseable image >= 1200x630",
+					actual: absoluteImageUrl,
+					project,
+				});
+			} else if (dims.w < 1200 || dims.h < 630) {
 				recordFinding({
 					url,
 					check: "seo-og-image-small",
@@ -583,7 +613,15 @@ export async function checkSeo(
 		const tag = (h.hreflang || "").trim();
 		const href = (h.href || "").trim();
 		const validTag = tag === "x-default" || isValidBcp47(tag);
-		const absolute = href.startsWith("http://") || href.startsWith("https://");
+		// Parse hreflang href the same way as canonical. Prefix-match passes
+		// malformed absolute-looking values; URL parsing rejects them.
+		let absolute = false;
+		try {
+			const parsed = new URL(href);
+			absolute = parsed.protocol === "http:" || parsed.protocol === "https:";
+		} catch {
+			absolute = false;
+		}
 		if (!validTag || !absolute) {
 			recordFinding({
 				url,

@@ -91,6 +91,17 @@ async function main(): Promise<number> {
 		process.env.RECCE_RUN_LOG ?? "/tmp/recce-last-run.log",
 	);
 
+	// Surface outer-timeout wedges in the Discord post. run-daily.sh exports
+	// RECCE_RUNNER_EXIT_CODE before invoking us; exit code 124 = `timeout`
+	// killed the runner because Playwright's own globalTimeout failed to fire.
+	const runnerExit = process.env.RECCE_RUNNER_EXIT_CODE;
+	const wedged = runnerExit === "124";
+	if (wedged) {
+		console.warn(
+			`[recce-post] runner exit code 124 detected — outer timeout fired; reporting partial artifact`,
+		);
+	}
+
 	try {
 		await deliverReport({
 			webhookUrl,
@@ -98,13 +109,23 @@ async function main(): Promise<number> {
 			artifactPath: latest,
 			suiteSummary: {
 				passed: summary.passed,
-				failed: summary.failed,
+				failed: wedged ? summary.failed + 1 : summary.failed,
 				skipped: summary.skipped,
 				totalDurationSec: summary.durationSec,
 				baseURL,
 				hasRecaptcha: process.env.RECCE_RECAPTCHA !== "false",
 			},
-			failureDetails: [],
+			failureDetails: wedged
+				? [
+						{
+							title: "runner-wedged",
+							error:
+								`Playwright runner exceeded the outer timeout and was SIGTERM'd. ` +
+								`globalTimeout did not self-recover. Findings below reflect ` +
+								`whatever the JSONL captured before the wedge.`,
+						},
+					]
+				: [],
 		});
 		console.log(`[recce-post] Discord report posted (mode=${mode})`);
 		return 0;

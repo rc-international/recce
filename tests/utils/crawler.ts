@@ -85,13 +85,52 @@ const MAX_PAGES_ENV_OVERRIDE: number | null = (() => {
  * until then, pinning to 1 is the correct fix. The env knob is retained as
  * a safety cap so an operator cannot accidentally bump it beyond 1.
  */
-const DEFAULT_CONCURRENCY = Math.max(
-	1,
-	Math.min(1, Number(process.env.CRAWL_CONCURRENCY ?? "1")),
-);
-const MIN_GOTO_INTERVAL_MS = 750;
+// Sanitize CRAWL_CONCURRENCY before clamping. A non-numeric env value makes
+// Number(...) return NaN, and Math.{max,min} preserve NaN through the chain;
+// passing NaN to createSemaphore deadlocks the crawler (the `active < n`
+// check is always false when n is NaN). Fall back to 1 on any non-finite
+// or non-positive value, then clamp to [1, 1] (current concurrency cap).
+const DEFAULT_CONCURRENCY = (() => {
+	const raw = Number(process.env.CRAWL_CONCURRENCY ?? "1");
+	const safe = Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 1;
+	return Math.max(1, Math.min(1, safe));
+})();
+// 3000ms per goto: deliberately slow so the page's own RSC prefetches +
+// our links.ts HEAD spray don't stack with the next page's own burst,
+// triggering Vercel/CDN per-IP rate limits. Reproducible 429 cascades pre-2026-05-05
+// (mata-roma, chapada-dos-guimaraes-mt, goiatuba-go) showed the burst-source
+// is the page lifecycle, not the goto cadence — but spacing gotos still
+// gives the upstream rate-limit bucket time to refill between pages.
+const MIN_GOTO_INTERVAL_MS = Number(process.env.RECCE_GOTO_INTERVAL_MS ?? "3000");
 const MAX_RATE_LIMITED = Number(process.env.RECCE_MAX_RATE_LIMITED ?? "10");
 const BACKOFF_STEPS_MS = [2000, 4000, 8000, 30000];
+
+/**
+ * Daily-stable Fisher-Yates shuffle. Same UTC date → same order; different
+ * date → different order. Lets pulse runs cover different sitemap slices
+ * across days while remaining reproducible within a day (re-running today
+ * crawls the same set of pages, useful for debugging).
+ */
+function dailyShuffle<T>(arr: T[], dateKey: string): T[] {
+	let seed = 0;
+	for (let i = 0; i < dateKey.length; i++) {
+		seed = (seed * 31 + dateKey.charCodeAt(i)) | 0;
+	}
+	// Mulberry32 — small, fast, well-distributed seedable PRNG.
+	let s = seed >>> 0;
+	const rand = (): number => {
+		s = (s + 0x6d2b79f5) >>> 0;
+		let t = Math.imul(s ^ (s >>> 15), 1 | s);
+		t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+		return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+	};
+	const out = arr.slice();
+	for (let i = out.length - 1; i > 0; i--) {
+		const j = Math.floor(rand() * (i + 1));
+		[out[i], out[j]] = [out[j], out[i]];
+	}
+	return out;
+}
 
 const TRACK_PARAM_RE = /^(utm_|gclid$|fbclid$)/i;
 const ALLOWED_PATH_RE = /^\/(articles|sites)\//;
@@ -151,8 +190,18 @@ function isSameOrigin(candidate: string, origin: string): boolean {
 // Default fetcher — uses global fetch (Bun + Node 18+)
 // -----------------------------------------------------------------------------
 
+// Cap sitemap/robots fetches so a stalled origin can't wedge the crawler
+// before any page.goto() timeouts or rate-limit logic kick in. AbortSignal.timeout
+// is supported on Bun + Node 17.3+ (covers all production targets).
+const DEFAULT_FETCH_TIMEOUT_MS = Number(
+	process.env.RECCE_FETCH_TIMEOUT_MS ?? "15000",
+);
+
 const defaultFetcher: Fetcher = async (url: string) => {
-	const res = await fetch(url, { redirect: "follow" });
+	const res = await fetch(url, {
+		redirect: "follow",
+		signal: AbortSignal.timeout(DEFAULT_FETCH_TIMEOUT_MS),
+	});
 	const contentType = res.headers.get("content-type") ?? "";
 	const retryAfter = res.headers.get("retry-after");
 	const isGz = url.endsWith(".gz");
@@ -486,7 +535,24 @@ export async function crawl(
 
 	type Task = { url: string; depth: number; retried: boolean };
 	const queue: Task[] = [];
-	for (const u of queueSet) queue.push({ url: u, depth: 0, retried: false });
+	// Daily-stable shuffle so pulse runs hit different sitemap slices on
+	// different days. Always-keep configured seeds at the front (the spec's
+	// hardcoded entry points like "/" should always be visited) — only
+	// shuffle the tail (sitemap-discovered URLs) which is where the volume
+	// and per-day rotation matters.
+	const configuredSet = new Set<string>();
+	for (const s of config.seedUrls) {
+		const n = normaliseUrl(s, config.baseURL);
+		if (n) configuredSet.add(n);
+	}
+	const allSeeds = Array.from(queueSet);
+	const fixedHead = allSeeds.filter((u) => configuredSet.has(u));
+	const shufflable = allSeeds.filter((u) => !configuredSet.has(u));
+	const dateKey =
+		process.env.RECCE_SHUFFLE_KEY ?? new Date().toISOString().slice(0, 10);
+	const shuffled = dailyShuffle(shufflable, dateKey);
+	for (const u of fixedHead) queue.push({ url: u, depth: 0, retried: false });
+	for (const u of shuffled) queue.push({ url: u, depth: 0, retried: false });
 
 	const visited = new Set<string>();
 	const discoveredLinks = new Set<string>();

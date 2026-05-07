@@ -39,11 +39,15 @@ test.describe("Articles BFS crawl", () => {
 		}
 		const project = testInfo.project.name as Finding["project"];
 		const mode = (process.env.RECCE_MODE as "pulse" | "audit") || "pulse";
-		// Pulse hardcodes 25 to stay inside the 5-minute daily-sanity budget.
-		// Audit defers to the crawler defaults (DEFAULT_MAX_PAGES_AUDIT=2000,
-		// or MAX_PAGES env override from run-audit.sh) by leaving maxPages
+		// Pulse samples 100 pages per day under the polite cadence (3s between
+		// gotos, 300ms between in-page HEADs, daily-rotated seed shuffle in the
+		// crawler so each run hits a different slice of the sitemap). At 100
+		// pages/day we cycle through ~3000 sitemap pages in roughly a month
+		// while staying well under CDN rate-limit cascade thresholds. Audit
+		// defers to the crawler defaults (DEFAULT_MAX_PAGES_AUDIT=2000, or
+		// MAX_PAGES env override from run-audit.sh) by leaving maxPages
 		// undefined so ops can tune without editing the spec.
-		const maxPages = mode === "audit" ? undefined : 25;
+		const maxPages = mode === "audit" ? undefined : 100;
 
 		// Shared caches across B1/B2 for this crawl run.
 		const checkedLinks = new Map<string, number>();

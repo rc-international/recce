@@ -54,6 +54,11 @@ function runInChild(
 		RECCE_MODE: "pulse",
 		RECCE_RUN_TS: "2026-04-23T00-00-00.000Z",
 		BASE_URL: "https://example.test",
+		// Production crawler paces gotos at 3000ms to avoid CDN rate-limit
+		// cascades. In unit tests we drive a stub goto with no real network,
+		// so the pacing is pure dead time. Disable it so multi-page crawls
+		// (e.g. MAX_PAGES cap) finish inside Bun's 5s default test timeout.
+		RECCE_GOTO_INTERVAL_MS: "0",
 		...extraEnv,
 	};
 	const scriptPath = path.join(

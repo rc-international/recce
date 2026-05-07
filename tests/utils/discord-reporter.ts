@@ -63,7 +63,11 @@ export function classifyDelivery(
 	fileSizeBytes: number,
 ): DeliveryPlan {
 	const scores = scoreByUrl(artifact);
-	const failing = scores.filter((s) => s.errors > 0);
+	// Include warning-only URLs as actionable signal. scoreByUrl() already
+	// surfaces both errors and warns; restricting `failing` to errors-only
+	// dropped warn-heavy runs from the per-URL list and let them render as
+	// an empty inline embed with no actionable detail.
+	const failing = scores.filter((s) => s.errors > 0 || s.warns > 0);
 	const failingUrlCount = failing.length;
 
 	let mode: DeliveryMode;
@@ -491,11 +495,18 @@ class DiscordReporter implements Reporter {
 		});
 	}
 
-	async onEnd(_result: FullResult) {
-		if (this.results.length === 0) return;
-
+	async onEnd(result: FullResult) {
 		const webhookUrl = process.env.RECCE_DISCORD_WEBHOOK;
 		if (!webhookUrl) return;
+		// Don't drop the report when discovery/startup/setup failed before
+		// any onTestEnd fired. The fallback path below (lines ~538) handles
+		// the empty-artifact case and posts a bare suite-summary message so
+		// operators still hear about wedged runs.
+		if (this.results.length === 0) {
+			console.warn(
+				`[recce-discord] no tests reached onTestEnd (status=${result.status}) — posting fallback summary`,
+			);
+		}
 
 		const totalDuration = ((Date.now() - this.startTime) / 1000).toFixed(1);
 		const passed = this.results.filter((r) => r.status === "passed").length;

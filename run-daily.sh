@@ -55,9 +55,18 @@ echo "[$(date -u '+%Y-%m-%d %H:%M:%S UTC')] Starting Recce E2E suite (mode=$RECC
 export RECCE_START_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 EXIT_CODE=0
-npx playwright test 2>&1 | tee /tmp/recce-last-run.log || EXIT_CODE=$?
+# Outer hang guard. Playwright's globalTimeout (currently 90min for pulse,
+# 120min for audit) should always fire first, but if the runner itself wedges
+# (Node event loop blocked, globalTimeout watchdog dead), this `timeout` SIGTERMs
+# the npx process so the shell can still reach the post-run driver below.
+# 130min covers pulse worst-case; audit gets 150min via RECCE_OUTER_TIMEOUT.
+OUTER_TIMEOUT="${RECCE_OUTER_TIMEOUT:-130m}"
+timeout --kill-after=60s "$OUTER_TIMEOUT" \
+  npx playwright test 2>&1 | tee /tmp/recce-last-run.log || EXIT_CODE=$?
 
-if [[ "$EXIT_CODE" -ne 0 ]]; then
+if [[ "$EXIT_CODE" -eq 124 ]]; then
+  echo "[$(date -u '+%Y-%m-%d %H:%M:%S UTC')] Recce E2E suite WEDGED — outer timeout (${OUTER_TIMEOUT}) fired"
+elif [[ "$EXIT_CODE" -ne 0 ]]; then
   echo "[$(date -u '+%Y-%m-%d %H:%M:%S UTC')] Recce E2E suite FAILED (exit code: $EXIT_CODE)"
 else
   echo "[$(date -u '+%Y-%m-%d %H:%M:%S UTC')] Recce E2E suite complete — all passed"
@@ -68,7 +77,9 @@ fi
 # Discord post. Idempotent: if teardown already ran, consolidation reproduces
 # the same artifact; the Discord webhook accepts duplicate posts (dedup is
 # the operator's job in that rare case).
-RECCE_RUN_LOG=/tmp/recce-last-run.log npx tsx tests/run-post.ts \
+RECCE_RUN_LOG=/tmp/recce-last-run.log \
+  RECCE_RUNNER_EXIT_CODE="$EXIT_CODE" \
+  npx tsx tests/run-post.ts \
   || echo "[$(date -u '+%Y-%m-%d %H:%M:%S UTC')] WARN: post-run driver failed (Discord post may be missing)"
 
 exit "$EXIT_CODE"
