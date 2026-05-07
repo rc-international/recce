@@ -95,12 +95,18 @@ export async function checkCountryPage(
 	const expectedCountryLower = country.toLowerCase();
 	const cityHrefs = new Set<string>();
 	for (const href of snap.anchors) {
-		let path = "";
+		let resolved: URL;
 		try {
-			path = new URL(href, parsed.origin).pathname;
+			resolved = new URL(href, parsed.origin);
 		} catch {
 			continue;
 		}
+		// Only same-origin anchors count toward density. `new URL(absolute, base)`
+		// uses the absolute href as-is, so a cross-origin anchor like
+		// `https://partner.test/articles/es/Mexico/city` would otherwise pass
+		// every segment check below and inflate the count.
+		if (resolved.origin !== parsed.origin) continue;
+		const path = resolved.pathname;
 		const hSegs = pathSegments(path);
 		if (
 			hSegs.length >= 4 &&

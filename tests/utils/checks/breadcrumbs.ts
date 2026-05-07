@@ -222,7 +222,16 @@ export async function checkBreadcrumbs(
 			const matchesLang = firstLang === lang;
 			const matchesCountry =
 				(firstCountry || "").toLowerCase() === (country || "").toLowerCase();
-			if (!sameOrigin || !matchesLang || !matchesCountry) {
+			// First crumb must point at the COUNTRY page itself, not a deeper
+			// city under the same country (which would still satisfy lang +
+			// country segment checks but is not the correct breadcrumb root).
+			const isCountryDepth = firstSegs.length === 3;
+			if (
+				!sameOrigin ||
+				!matchesLang ||
+				!matchesCountry ||
+				!isCountryDepth
+			) {
 				recordFinding({
 					url,
 					check: "breadcrumb-country-link-wrong",

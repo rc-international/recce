@@ -362,6 +362,35 @@ describe("checkCountryPage", () => {
 		expect(findings).toEqual([]);
 	});
 
+	test("cross-origin anchors do not count toward city-density threshold", () => {
+		// Regression guard: `new URL(absolute, base)` ignores the base when
+		// `absolute` is already absolute, so a foreign-origin anchor whose
+		// pathname matches /articles/<lang>/<country>/<city> would otherwise
+		// inflate cityHrefs.size and suppress a legitimate finding.
+		const ts = "2026-05-07T12-11-00.000Z";
+		const findings = runScenario(
+			cpScript({
+				url: "https://valors.io/articles/es/mexico",
+				h1: "México",
+				canonical: "https://valors.io/articles/es/mexico",
+				hreflangs: HEALTHY_HREFLANGS,
+				cities: ["/articles/es/Mexico/only-one"],
+				extraAnchors: [
+					"https://partner-site.test/articles/es/Mexico/foreign-city-1",
+					"https://partner-site.test/articles/es/Mexico/foreign-city-2",
+					"https://partner-site.test/articles/es/Mexico/foreign-city-3",
+				],
+			}),
+			ts,
+		);
+		const tooFew = findings.filter(
+			(f) => f.check === "country-too-few-cities",
+		);
+		expect(tooFew).toHaveLength(1);
+		// Only the one same-origin city counts.
+		expect(tooFew[0].actual).toBe("1");
+	});
+
 	test("city links matched case-insensitively on country segment", () => {
 		// Production country page uses lowercase URL (/articles/es/mexico)
 		// but the city links use capitalized country segment (/Mexico/...).

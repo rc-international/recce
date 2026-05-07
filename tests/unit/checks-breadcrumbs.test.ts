@@ -299,6 +299,37 @@ describe("checkBreadcrumbs", () => {
 		expect(notAbs[0].severity).toBe("error");
 	});
 
+	test("first crumb pointing at a deeper city under the right country still flags breadcrumb-country-link-wrong", () => {
+		// Regression guard: same lang + country segments but depth 4 (a city
+		// URL) is NOT a valid country root and must be flagged. Without the
+		// depth-3 check, this slipped through silently.
+		const ts = "2026-05-07T10-08-00.000Z";
+		const html = bcHtml(
+			[
+				{
+					"@type": "ListItem",
+					position: 1,
+					name: "México",
+					item: "https://valors.io/articles/es/Mexico/another-city",
+				},
+				{ "@type": "ListItem", position: 2, name: "Ciudad De Mexico" },
+			],
+			'<a href="/articles/es/Mexico">México</a>',
+		);
+		const findings = runScenario(
+			bcScript({
+				url: "https://valors.io/articles/es/Mexico/ciudad-de-mexico",
+				html,
+			}),
+			ts,
+		);
+		const wrong = findings.filter(
+			(f) => f.check === "breadcrumb-country-link-wrong",
+		);
+		expect(wrong).toHaveLength(1);
+		expect(wrong[0].severity).toBe("error");
+	});
+
 	test("non-articles URL is skipped (no findings)", () => {
 		const ts = "2026-05-07T10-07-00.000Z";
 		const html = `<!doctype html><html><head></head><body>home</body></html>`;
