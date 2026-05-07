@@ -1,14 +1,35 @@
-# Code Review CI — installed by org-wide rollout 2026-04-22
+# Code Review CI — installed by `wilco init`
 # AI-powered code review on every PR via rc-international/ci
+#
 # Required org secret: CEREBRAS_API_KEY
+#
+# Two jobs:
+#   review              — LLM code review on every PR (pull_request).
+#                          Skipped internally for dependabot PRs (see
+#                          rc-international/ci code-review.yml).
+#   dependabot-approve  — posts a valors-release-bot APPROVE on dependabot
+#                          PRs so they satisfy the required-approving-review
+#                          branch-protection rule. Triggered via
+#                          pull_request_target so org Actions secrets are
+#                          available (dependabot pull_request runs have
+#                          restricted secrets). Safe — does not check out PR
+#                          HEAD; only calls the GitHub REST API.
 
 name: Code Review
 
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+  pull_request_target:
+    types: [opened, synchronize, reopened]
 
 jobs:
   review:
+    if: github.event_name == 'pull_request'
     uses: rc-international/ci/.github/workflows/code-review.yml@main
+    secrets: inherit
+
+  dependabot-approve:
+    if: github.event_name == 'pull_request_target' && github.event.pull_request.user.login == 'dependabot[bot]'
+    uses: rc-international/ci/.github/workflows/dependabot-approve.yml@main
     secrets: inherit
