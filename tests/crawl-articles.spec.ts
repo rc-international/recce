@@ -1,6 +1,8 @@
 import { expect, type Page, test } from "@playwright/test";
+import { checkBreadcrumbs } from "./utils/checks/breadcrumbs";
 import { checkButtons } from "./utils/checks/buttons";
 import { checkContentQuality } from "./utils/checks/content";
+import { checkCountryPage } from "./utils/checks/country-page";
 import { checkImages } from "./utils/checks/images";
 import { checkLinks } from "./utils/checks/links";
 import { createRuntimeErrorHook } from "./utils/checks/runtime-errors";
@@ -25,9 +27,21 @@ import type { Finding } from "./utils/types";
  */
 
 test.describe("Articles BFS crawl", () => {
+	// Country pages (`/articles/<lang>/<country>`) are the entry into each
+	// locale's article tree. Seeding all four lang×country combinations
+	// guarantees the breadcrumb check runs against both the country-page
+	// shape (1 BreadcrumbList item) and at least one city-page shape
+	// (≥2 items, first linked to country) every run, regardless of how the
+	// daily-rotated sitemap shuffle samples deeper pages. The previous
+	// hardcoded leaf seed `/articles/en/Mexico/CDMX/Ciudad-de-Mexico/coffee_shop`
+	// 404'd after the breadcrumb restructuring (depth-5 path no longer
+	// exists) — replaced with the canonical country entry points.
 	const crawlSeeds = [
 		"/",
-		"/articles/en/Mexico/CDMX/Ciudad-de-Mexico/coffee_shop",
+		"/articles/en/mexico",
+		"/articles/es/mexico",
+		"/articles/pt/brazil",
+		"/articles/es/brazil",
 	];
 
 	test("crawl and verify articles pages", async ({
@@ -187,6 +201,27 @@ test.describe("Articles BFS crawl", () => {
 						});
 					} catch (e) {
 						console.debug(`[crawl-articles] checkSeo ${url} failed:`, e);
+					}
+
+					// C20: BreadcrumbList JSON-LD shape + visible breadcrumb anchor.
+					try {
+						await checkBreadcrumbs(p, { url, project });
+					} catch (e) {
+						console.debug(
+							`[crawl-articles] checkBreadcrumbs ${url} failed:`,
+							e,
+						);
+					}
+
+					// C21: country-page integrity (cities, hreflang coverage,
+					// self-canonical, h1). No-op on non-country URLs.
+					try {
+						await checkCountryPage(p, { url, project });
+					} catch (e) {
+						console.debug(
+							`[crawl-articles] checkCountryPage ${url} failed:`,
+							e,
+						);
 					}
 				},
 			],
