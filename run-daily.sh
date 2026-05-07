@@ -1,23 +1,85 @@
 #!/usr/bin/env bash
-# Recce Daily E2E Suite — runs at 08:30 UTC via cron
-set -uo pipefail
+# Recce Daily E2E Suite — runs at 08:30 UTC via cron.
+# Pulse mode: fast chromium-only crawl for daily sanity.
+set -euo pipefail
 
 cd /home/gordon/work/recce || exit 1
 
-export BASE_URL="${BASE_URL:-https://valors.io}"
-export RECCE_DISCORD_WEBHOOK="${RECCE_DISCORD_WEBHOOK:-https://discord.com/api/webhooks/1430931672500535406/f2bEMG3ITW96vHNnB3tUPB5TNUHFWbRla2BT3epM5L51qNjfwfMDUHXWOnYXxKPsydhu}"
-NODE_VERSION=$(ls /home/gordon/.nvm/versions/node/ 2>/dev/null | tail -1)
-export PATH="/home/gordon/.nvm/versions/node/${NODE_VERSION}/bin:$PATH"
+# Hard-require env vars (no plaintext fallbacks — removed the hardcoded webhook
+# previously at line 8 as a security liability).
+if [[ -z "${BASE_URL:-}" ]]; then
+  echo "BASE_URL required (e.g. BASE_URL=https://valors.io)" >&2
+  exit 1
+fi
+if [[ -z "${RECCE_DISCORD_WEBHOOK:-}" ]]; then
+  echo "RECCE_DISCORD_WEBHOOK required" >&2
+  exit 1
+fi
 
-echo "[$(date -u '+%Y-%m-%d %H:%M:%S UTC')] Starting Recce E2E suite"
+export BASE_URL
+export RECCE_DISCORD_WEBHOOK
+export RECCE_MODE="${RECCE_MODE:-pulse}"
+
+# PID lock — prevents two pulse runs colliding on the same findings directory.
+PID_FILE="/tmp/recce-pulse.pid"
+if [[ -f "$PID_FILE" ]]; then
+  OLD_PID="$(cat "$PID_FILE" 2>/dev/null || echo '')"
+  if [[ -n "$OLD_PID" ]] && kill -0 "$OLD_PID" 2>/dev/null; then
+    echo "recce-pulse: already running (PID $OLD_PID) — exiting" >&2
+    exit 1
+  else
+    echo "recce-pulse: stale PID file (PID=$OLD_PID not alive), overwriting" >&2
+    rm -f "$PID_FILE"
+  fi
+fi
+echo $$ > "$PID_FILE"
+trap 'rm -f "$PID_FILE"' EXIT
+
+# Node / PATH setup — pick highest semver (not lexicographic, which picks v9
+# before v18). `sort -V` is GNU sort version-sort; available on Ubuntu and
+# Debian-based VPS hosts the crawler runs on.
+if [[ -d /home/gordon/.nvm/versions/node ]]; then
+  # shellcheck disable=SC2012  # ls + sort -V is the portable version-sort path
+  NODE_VERSION="$(ls /home/gordon/.nvm/versions/node/ 2>/dev/null | sort -V | tail -1 || true)"
+  if [[ -n "$NODE_VERSION" ]]; then
+    export PATH="/home/gordon/.nvm/versions/node/${NODE_VERSION}/bin:$PATH"
+  fi
+fi
+
+echo "[$(date -u '+%Y-%m-%d %H:%M:%S UTC')] Starting Recce E2E suite (mode=$RECCE_MODE)"
+
+# Capture suite start so the post-run driver can compute a coherent duration
+# even when Playwright's globalTeardown / discord-reporter onEnd is skipped
+# (e.g. on globalTimeout abort, where Playwright force-stops workers without
+# letting reporters drain).
+export RECCE_START_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 EXIT_CODE=0
-npx playwright test 2>&1 | tee /tmp/recce-last-run.log || EXIT_CODE=$?
+# Outer hang guard. Playwright's globalTimeout (currently 90min for pulse,
+# 120min for audit) should always fire first, but if the runner itself wedges
+# (Node event loop blocked, globalTimeout watchdog dead), this `timeout` SIGTERMs
+# the npx process so the shell can still reach the post-run driver below.
+# 130min covers pulse worst-case; audit gets 150min via RECCE_OUTER_TIMEOUT.
+OUTER_TIMEOUT="${RECCE_OUTER_TIMEOUT:-130m}"
+timeout --kill-after=60s "$OUTER_TIMEOUT" \
+  npx playwright test 2>&1 | tee /tmp/recce-last-run.log || EXIT_CODE=$?
 
-if [ "$EXIT_CODE" -ne 0 ]; then
+if [[ "$EXIT_CODE" -eq 124 ]]; then
+  echo "[$(date -u '+%Y-%m-%d %H:%M:%S UTC')] Recce E2E suite WEDGED — outer timeout (${OUTER_TIMEOUT}) fired"
+elif [[ "$EXIT_CODE" -ne 0 ]]; then
   echo "[$(date -u '+%Y-%m-%d %H:%M:%S UTC')] Recce E2E suite FAILED (exit code: $EXIT_CODE)"
 else
   echo "[$(date -u '+%Y-%m-%d %H:%M:%S UTC')] Recce E2E suite complete — all passed"
 fi
 
-exit $EXIT_CODE
+# Post-run safety net — runs UNCONDITIONALLY so a Playwright globalTimeout
+# abort (which skips globalTeardown + reporter onEnd) still produces a
+# Discord post. Idempotent: if teardown already ran, consolidation reproduces
+# the same artifact; the Discord webhook accepts duplicate posts (dedup is
+# the operator's job in that rare case).
+RECCE_RUN_LOG=/tmp/recce-last-run.log \
+  RECCE_RUNNER_EXIT_CODE="$EXIT_CODE" \
+  npx tsx tests/run-post.ts \
+  || echo "[$(date -u '+%Y-%m-%d %H:%M:%S UTC')] WARN: post-run driver failed (Discord post may be missing)"
+
+exit "$EXIT_CODE"

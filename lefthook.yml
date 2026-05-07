@@ -75,9 +75,15 @@ pre-commit:
       # Skip cleanly in repos that have no tests/unit/ tree. E2E-only repos
       # (e.g. recce, which uses Playwright in tests/) run their suites in CI
       # and a daily cron — they are too heavy for a pre-commit gate.
+      #
+      # Outer timeout: 180s headroom — recce's seeded-bug fixtures launch
+      # real chromium browsers (B1/B2/B3) and the full suite is ~57s
+      # standalone; under parallel-hook contention it tips over a 60s gate.
+      # Per-test timeout bumped to 30000ms so chromium cold-start under load
+      # (typecheck running in parallel) doesn't trip Bun's 5000ms default.
       run: |
         if [ ! -d tests/unit ]; then echo "no tests/unit/ dir — skipping test-suite"; exit 0; fi
-        timeout 60 bun test \
+        timeout 180 bun test --timeout 30000 \
           $(find tests/unit -name '*.test.ts' \
             ! -name 'learning-extractor*' \
             ! -name 'skill-activations*' \
